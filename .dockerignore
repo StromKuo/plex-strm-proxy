@@ -1,0 +1,8 @@
+.git
+.gitignore
+.opencode
+.DS_Store
+.env
+.env.*
+README.md
+*_test.go

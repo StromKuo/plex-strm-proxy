@@ -1,0 +1,288 @@
+package app
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+)
+
+type metadataPartLookup struct {
+	Mapping     PartMapping
+	ContentType string
+	Body        []byte
+}
+
+func (s *Server) lookupMetadataPart(ctx context.Context, source *http.Request, metadataPath string) (PartMapping, error) {
+	lookup, err := s.lookupMetadataPartSnapshot(ctx, source, metadataPath)
+	if err != nil {
+		return PartMapping{}, err
+	}
+	return lookup.Mapping, nil
+}
+
+func (s *Server) lookupMetadataPartSnapshot(ctx context.Context, source *http.Request, metadataPath string) (metadataPartLookup, error) {
+	mediaIndex, err := queryIndex(source.URL.Query(), "mediaIndex")
+	if err != nil {
+		return metadataPartLookup{}, err
+	}
+	partIndex, err := queryIndex(source.URL.Query(), "partIndex")
+	if err != nil {
+		return metadataPartLookup{}, err
+	}
+
+	metadataURL := *s.cfg.PlexUpstream
+	metadataURL.Path = joinPlexPath(s.cfg.PlexUpstream.Path, metadataPath)
+	metadataURL.RawPath = ""
+	metadataQuery := url.Values{
+		"checkFiles":           {"1"},
+		"includeBandwidths":    {"1"},
+		"includeExternalMedia": {"1"},
+	}
+	if token := source.URL.Query().Get("X-Plex-Token"); token != "" {
+		metadataQuery.Set("X-Plex-Token", token)
+	}
+	metadataURL.RawQuery = metadataQuery.Encode()
+
+	metadataRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL.String(), nil)
+	if err != nil {
+		return metadataPartLookup{}, fmt.Errorf("create Plex metadata request: %w", err)
+	}
+	copyPlexRequestHeaders(metadataRequest.Header, source.Header)
+	accept := strings.TrimSpace(source.Header.Get("Accept"))
+	if accept == "" {
+		accept = "application/xml"
+	}
+	metadataRequest.Header.Set("Accept", accept)
+
+	response, err := s.plexClient.Do(metadataRequest)
+	if err != nil {
+		return metadataPartLookup{}, fmt.Errorf("request Plex metadata: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return metadataPartLookup{}, fmt.Errorf("Plex metadata returned HTTP %d", response.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, s.cfg.MaxPlexBodyBytes+1))
+	if err != nil {
+		return metadataPartLookup{}, fmt.Errorf("read Plex metadata: %w", err)
+	}
+	if int64(len(body)) > s.cfg.MaxPlexBodyBytes {
+		return metadataPartLookup{}, fmt.Errorf("Plex metadata exceeds configured size limit")
+	}
+	decoded, err := decodeStructuredBody(response.Header.Get("Content-Encoding"), body, s.cfg.MaxPlexBodyBytes)
+	if err != nil {
+		return metadataPartLookup{}, fmt.Errorf("decode Plex metadata: %w", err)
+	}
+
+	record, err := selectMetadataPart(response.Header.Get("Content-Type"), decoded, mediaIndex, partIndex)
+	if err != nil {
+		return metadataPartLookup{}, err
+	}
+	s.mappings.IngestStructuredResponse(response.Header.Get("Content-Type"), decoded, "", s.resolver)
+	for _, partID := range mappingPartIDs(record) {
+		if mapping, ok := s.mappings.Get(partID); ok {
+			return metadataPartLookup{Mapping: mapping, ContentType: response.Header.Get("Content-Type"), Body: decoded}, nil
+		}
+	}
+	return metadataPartLookup{}, fmt.Errorf("metadata Part has no usable id: mediaIndex=%d partIndex=%d", mediaIndex, partIndex)
+}
+
+func queryIndex(query url.Values, name string) (int, error) {
+	value := strings.TrimSpace(query.Get(name))
+	if value == "" {
+		return 0, nil
+	}
+	index, err := strconv.Atoi(value)
+	if err != nil || index < 0 {
+		return 0, fmt.Errorf("invalid %s %q", name, value)
+	}
+	return index, nil
+}
+
+func joinPlexPath(basePath, requestPath string) string {
+	basePath = strings.TrimRight(basePath, "/")
+	if basePath == "" {
+		return requestPath
+	}
+	return basePath + "/" + strings.TrimLeft(requestPath, "/")
+}
+
+func copyPlexRequestHeaders(destination, source http.Header) {
+	for _, name := range []string{
+		"Accept-Language",
+		"Authorization",
+		"User-Agent",
+		"X-Plex-Client-Identifier",
+		"X-Plex-Device",
+		"X-Plex-Device-Name",
+		"X-Plex-Platform",
+		"X-Plex-Platform-Version",
+		"X-Plex-Product",
+		"X-Plex-Protocol",
+		"X-Plex-Protocol-Version",
+		"X-Plex-Session-Identifier",
+		"X-Plex-Target-Client-Identifier",
+		"X-Plex-Token",
+	} {
+		for _, value := range source.Values(name) {
+			destination.Add(name, value)
+		}
+	}
+}
+
+func selectMetadataPart(contentType string, body []byte, mediaIndex, partIndex int) (partRecord, error) {
+	mediaParts := extractIndexedPartRecords(contentType, body)
+	if mediaIndex >= len(mediaParts) || partIndex >= len(mediaParts[mediaIndex]) {
+		return partRecord{}, fmt.Errorf("Plex metadata Part not found: mediaIndex=%d partIndex=%d", mediaIndex, partIndex)
+	}
+	return mediaParts[mediaIndex][partIndex], nil
+}
+
+func extractIndexedPartRecords(contentType string, body []byte) [][]partRecord {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	switch mediaType {
+	case "application/xml", "text/xml", "application/plex+xml":
+		return extractXMLMediaPartRecords(body)
+	case "application/json", "text/json":
+		return extractJSONMediaPartRecords(body)
+	default:
+		return nil
+	}
+}
+
+func extractXMLMediaPartRecords(body []byte) [][]partRecord {
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	var result [][]partRecord
+	currentMedia := -1
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch typed := token.(type) {
+		case xml.StartElement:
+			if typed.Name.Local == "Media" {
+				result = append(result, nil)
+				currentMedia = len(result) - 1
+				continue
+			}
+			if typed.Name.Local != "Part" || currentMedia < 0 {
+				continue
+			}
+			result[currentMedia] = append(result[currentMedia], partRecordFromXMLAttrs(typed.Attr))
+		case xml.EndElement:
+			if typed.Name.Local == "Media" {
+				currentMedia = -1
+			}
+		}
+	}
+	return result
+}
+
+func extractJSONMediaPartRecords(body []byte) [][]partRecord {
+	var value any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if decoder.Decode(&value) != nil {
+		return nil
+	}
+	var result [][]partRecord
+	var walk func(any)
+	walk = func(node any) {
+		object, ok := node.(map[string]any)
+		if !ok {
+			if list, ok := node.([]any); ok {
+				for _, child := range list {
+					walk(child)
+				}
+			}
+			return
+		}
+		for key, child := range object {
+			if !strings.EqualFold(key, "Media") {
+				walk(child)
+				continue
+			}
+			mediaList, ok := child.([]any)
+			if !ok {
+				mediaList = []any{child}
+			}
+			for _, mediaNode := range mediaList {
+				mediaObject, ok := mediaNode.(map[string]any)
+				if !ok {
+					continue
+				}
+				partValue, ok := objectValue(mediaObject, "Part")
+				if !ok {
+					continue
+				}
+				partList, ok := partValue.([]any)
+				if !ok {
+					partList = []any{partValue}
+				}
+				var records []partRecord
+				for _, partNode := range partList {
+					if partObject, ok := partNode.(map[string]any); ok {
+						records = append(records, partRecordFromJSONObject(partObject))
+					}
+				}
+				if len(records) > 0 {
+					result = append(result, records)
+				}
+			}
+		}
+	}
+	walk(value)
+	return result
+}
+
+func objectValue(object map[string]any, name string) (any, bool) {
+	for key, value := range object {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func partRecordFromXMLAttrs(attributes []xml.Attr) partRecord {
+	var record partRecord
+	for _, attribute := range attributes {
+		switch strings.ToLower(attribute.Name.Local) {
+		case "id":
+			record.ID = attribute.Value
+		case "file":
+			record.File = attribute.Value
+		case "key":
+			record.Key = attribute.Value
+		case "path":
+			record.Path = attribute.Value
+		}
+	}
+	return record
+}
+
+func partRecordFromJSONObject(object map[string]any) partRecord {
+	return partRecord{
+		ID:   jsonObjectString(object, "id"),
+		File: jsonObjectString(object, "file"),
+		Key:  jsonObjectString(object, "key"),
+		Path: jsonObjectString(object, "path"),
+	}
+}
+
+func jsonObjectString(object map[string]any, name string) string {
+	value, ok := objectValue(object, name)
+	if !ok {
+		return ""
+	}
+	return jsonString(value)
+}

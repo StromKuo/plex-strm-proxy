@@ -1,0 +1,123 @@
+# plex-strm-proxy
+
+[English](README.md) · 简体中文
+
+帮助 Plex 播放 `.strm` 文件所引用媒体的 Go 反向代理，面向 Plex Web、app.plex.tv 和官方 Plex 客户端。
+
+代理不会修改 Plex 的媒体库和数据库。
+
+## 工作方式
+
+对于 STRM 媒体，代理优先把客户端重定向到 `.strm` 中的真实 HTTP(S) 媒体 URL。这样客户端可以直接从媒体源获取媒体字节，完整文件不会经过 Plex 或 NAS。
+
+当客户端无法直接播放源文件时，可以对 STRM 媒体启用可选的 HLS 兼容兜底，把媒体转换成客户端能够处理的格式。这条路径会使用 FFmpeg，只适用于 STRM 媒体；普通 Plex 媒体仍使用 Plex 自己的播放和转码流程。
+
+## 前置条件
+
+- Plex Media Server 中已经能看到 `.strm` 媒体条目。
+- 容器需要以只读方式访问保存 `.strm` 文件的目录。
+- 使用 redirect 模式时，播放客户端能够访问真实媒体 URL。
+- 媒体源最好支持 HTTP Range 请求。Range 请求用于拖动进度和分段读取。
+- 只有启用 STRM HLS 兜底时才需要 FFmpeg。
+
+## 快速开始
+
+```bash
+docker build -t plex-strm-proxy .
+
+docker run --rm \
+  --name plex-strm-proxy \
+  -p 3001:3001 \
+  -e PLEX_UPSTREAM=http://plex:32400 \
+  -e STRM_ROOT=/media \
+  -v /path/to/plex/media:/media:ro \
+  plex-strm-proxy
+```
+
+挂载配置中，左侧是宿主机路径，右侧是容器内路径。代理容器内的路径必须和 Plex 使用的 `.strm` 路径以及 `STRM_ROOT` 配置一致。
+
+例如，Plex 容器使用：
+
+```bash
+-v /host/media:/media
+```
+
+那么代理容器应使用：
+
+```bash
+-v /host/media:/media:ro
+-e STRM_ROOT=/media
+```
+
+如果有多个 STRM 根目录，可以用 `STRM_ROOTS` 替代 `STRM_ROOT`：
+
+```bash
+-e STRM_ROOTS=/Movies,/TV
+-v /path/to/movies:/Movies:ro
+-v /path/to/tv:/TV:ro
+```
+
+## Plex 配置
+
+在 Plex Server Settings → Network → `Custom server access URLs` 中填入客户端可以访问的代理地址。
+
+示例：
+
+```text
+http://plex-proxy.example.com:3001
+https://plex-proxy.example.com
+```
+
+如果通过公网访问，应使用带有效证书的 HTTPS 地址。HTTPS 可以由外部反向代理或 Tunnel 提供。
+
+修改地址后，如果客户端仍使用旧的服务器连接，可以退出账号后重新登录。测试时应同时播放普通 Plex 媒体和 STRM 媒体。
+
+### 连接路径选择
+
+在局域网内，Plex 直连通常使用 Plex 服务器局域网地址的 `32400` 端口；本代理监听 `3001` 端口。如果客户端直接连接 Plex 服务器的 `32400` 端口，就会绕过代理。要在局域网内测试或使用代理，应让客户端访问 Plex 服务器局域网地址的 `3001` 端口，或访问解析到代理的局域网 DNS 名称。
+
+如果要在公网环境下通过官方 App 或 app.plex.tv 使用本项目，应配置一个公网可访问的自定义服务器访问 URL，实际使用建议是带有效证书的 HTTPS 域名。对于本项目的公网代理部署，应关闭 Plex 的 `Remote Access`，避免 Plex 同时发布自己的公网 `32400` 直连入口。
+
+## 常用配置
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `PLEX_UPSTREAM` | `http://plex:32400` | Plex Media Server 地址 |
+| `LISTEN_ADDR` | `0.0.0.0:3001` | 代理监听地址 |
+| `STRM_ROOT` / `STRM_ROOTS` | `/media` | 只读 STRM 根目录 |
+| `PLAYBACK_MODE` | `redirect` | `redirect` 重定向到媒体源；`proxy` 让媒体流量经过本服务 |
+| `STRM_HLS_TRANSCODE` | `true` | 启用 STRM HLS 兼容兜底 |
+
+出于安全考虑，默认允许标准端口上的 HTTP/HTTPS 媒体 URL。私网目标和非标准端口默认禁止，必须显式启用。
+
+## 限制
+
+- redirect 模式要求播放客户端自身能够访问外部媒体 URL。
+- 如果媒体链接带有签名或过期时间参数，该链接必须在整个播放期间保持有效，并且媒体源需要支持分段读取和拖动进度（HTTP Range）。
+- HLS 兜底会占用代理 CPU、临时磁盘空间和网络带宽。
+- HLS 长距离拖动可能临时占用额外的磁盘空间和网络带宽。
+- 是否能播放仍取决于客户端对视频编码、容器、音频格式和字幕的支持。
+
+## 排障
+
+复现问题时，可以跟踪代理日志：
+
+```bash
+docker logs -f plex-strm-proxy
+```
+
+请依次确认：
+
+1. 客户端可以访问 `Custom server access URLs` 中配置的地址；
+2. 客户端可以访问 STRM 文件中的真实媒体 URL；
+3. 媒体源支持 Range 请求；
+4. Plex Server 和代理之间可以互相访问；
+5. 普通 Plex 媒体仍能播放，以区分 Plex 网络问题和 STRM 兼容性问题。
+
+## 开发
+
+```bash
+go test ./...
+```
+
+实现和维护规则请阅读 [AGENTS.md](AGENTS.md)。

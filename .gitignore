@@ -1,0 +1,21 @@
+# Local orchestration and agent state
+.opencode/
+
+# Operating-system and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Build and test artifacts
+bin/
+dist/
+coverage.out
+coverage.html
+
