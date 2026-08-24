@@ -22,16 +22,28 @@
 
 ## 快速开始
 
-```bash
-docker build -t plex-strm-proxy .
+已发布的镜像位于 GHCR。镜像内包含用于 STRM HLS 兼容兜底的 FFmpeg；使用 redirect 直连模式时不会调用 FFmpeg。
 
+```bash
+docker pull ghcr.io/stromkuo/plex-strm-proxy:latest
+```
+
+如果希望固定使用某个版本，可以将 `latest` 换成类似 `1.0.0` 的版本标签。
+
+```bash
 docker run --rm \
   --name plex-strm-proxy \
   -p 3001:3001 \
   -e PLEX_UPSTREAM=http://plex:32400 \
   -e STRM_ROOT=/media \
   -v /path/to/plex/media:/media:ro \
-  plex-strm-proxy
+  ghcr.io/stromkuo/plex-strm-proxy:latest
+```
+
+如果不使用已发布镜像，也可以在本地构建：
+
+```bash
+docker build -t plex-strm-proxy .
 ```
 
 挂载配置中，左侧是宿主机路径，右侧是容器内路径。代理容器内的路径必须和 Plex 使用的 `.strm` 路径以及 `STRM_ROOT` 配置一致。
@@ -119,5 +131,14 @@ docker logs -f plex-strm-proxy
 ```bash
 go test ./...
 ```
+
+GitHub Actions 会在 push 和 Pull Request 时运行测试并验证 Docker 构建。发布带有 `v1.0.0` 这类标签的 GitHub Release 后，Action 会构建多架构镜像并发布到 GHCR：
+
+```text
+ghcr.io/stromkuo/plex-strm-proxy:1.0.0
+ghcr.io/stromkuo/plex-strm-proxy:latest
+```
+
+只有非预发布版本会更新 `latest` 标签。GHCR 第一次创建镜像包时可能默认为 Private；如果希望用户无需登录即可拉取镜像，需要在镜像包设置中将可见性改为 Public。
 
 实现和维护规则请阅读 [AGENTS.md](AGENTS.md)。

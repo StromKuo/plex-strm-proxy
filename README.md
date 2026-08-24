@@ -22,16 +22,28 @@ When a client cannot play the source directly, an optional HLS compatibility fal
 
 ## Quick start
 
-```bash
-docker build -t plex-strm-proxy .
+The published image is available from GHCR. It includes FFmpeg for the optional STRM HLS fallback; redirect mode does not invoke FFmpeg.
 
+```bash
+docker pull ghcr.io/stromkuo/plex-strm-proxy:latest
+```
+
+Use a version tag such as `1.0.0` when you want to pin a release instead of following `latest`.
+
+```bash
 docker run --rm \
   --name plex-strm-proxy \
   -p 3001:3001 \
   -e PLEX_UPSTREAM=http://plex:32400 \
   -e STRM_ROOT=/media \
   -v /path/to/plex/media:/media:ro \
-  plex-strm-proxy
+  ghcr.io/stromkuo/plex-strm-proxy:latest
+```
+
+To build locally instead of pulling the published image:
+
+```bash
+docker build -t plex-strm-proxy .
 ```
 
 In the volume mapping, the path on the left is on the host and the path on the right is inside the container. The proxy-side path must match the path Plex uses for the same `.strm` files and the configured `STRM_ROOT`.
@@ -119,5 +131,14 @@ Check that:
 ```bash
 go test ./...
 ```
+
+GitHub Actions runs the tests and a Docker build for pushes and pull requests. A published GitHub Release with a tag such as `v1.0.0` builds and publishes multi-platform images to GHCR:
+
+```text
+ghcr.io/stromkuo/plex-strm-proxy:1.0.0
+ghcr.io/stromkuo/plex-strm-proxy:latest
+```
+
+The `latest` tag is updated only for non-prerelease versions. The first GHCR package publication may be private by default; change the package visibility to Public in the package settings if anonymous pulls are desired.
 
 For implementation and maintenance rules, read [AGENTS.md](AGENTS.md). 
