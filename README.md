@@ -12,6 +12,8 @@ For an STRM item, the proxy prefers to redirect the client to the real HTTP(S) m
 
 When a client cannot play the source directly, an optional HLS compatibility fallback can convert STRM playback into a format the client can handle. This uses FFmpeg and applies only to STRM media; ordinary Plex media continues to use Plex's own playback and transcoding pipeline.
 
+Home and library metadata responses are rewritten without probing every remote STRM source. Detailed FFprobe inspection is deferred until playback preparation or a transcode starts, then reused from the in-memory probe cache.
+
 ## Requirements
 
 - Plex Media Server with `.strm` items already visible in the library.
@@ -101,6 +103,28 @@ For public use in the official app or app.plex.tv, configure a publicly reachabl
 | `STRM_HLS_TRANSCODE` | `true` | Enable STRM HLS compatibility fallback |
 
 For security, HTTP/HTTPS media URLs on standard ports are allowed by default. Private network targets and non-standard ports are blocked unless explicitly enabled.
+
+### STRM sources hosted on your own network
+
+A common setup points `.strm` files at a self-hosted service on the LAN, such as OpenList/alist running on the same NAS. Two settings become relevant:
+
+- `ALLOW_PRIVATE_TARGETS=true` — the proxy refuses private-network media targets by default (SSRF protection). Enable it only when the STRM URLs point at your own LAN addresses.
+- `--add-host media.example.com:192.168.1.10` — useful when the STRM domain resolves differently inside the container than on your LAN, for example when the domain is publicly proxied (Cloudflare) while the service actually runs on the LAN. The container uses the router's DNS, so its own outbound traffic (FFprobe probes, and all media bytes in `proxy` mode) would resolve the public address and detour through the public edge. The flag pins the domain to the LAN address. Because the pinned address is private, this flag also requires `ALLOW_PRIVATE_TARGETS=true`.
+
+| STRM URLs point at | Configuration |
+| --- | --- |
+| Public addresses (netdisk links, a public alist) | Defaults, nothing extra |
+| A LAN service whose domain already resolves to the LAN IP for everyone | `ALLOW_PRIVATE_TARGETS=true` |
+| A LAN service behind a publicly proxied domain | `--add-host` plus `ALLOW_PRIVATE_TARGETS=true` |
+
+```bash
+docker run ... \
+  -e ALLOW_PRIVATE_TARGETS=true \
+  --add-host oplist.example.com:192.168.1.10 \
+  ghcr.io/stromkuo/plex-strm-proxy:latest
+```
+
+In `redirect` mode the client still resolves the media URL on its own, so each client needs a working resolution path as well. If some clients resolve the domain poorly, either add a local DNS record on the router or switch to `proxy` mode, where media flows through the proxy container and only the proxy's resolution matters.
 
 ## Limitations
 

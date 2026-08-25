@@ -12,6 +12,8 @@
 
 当客户端无法直接播放源文件时，可以对 STRM 媒体启用可选的 HLS 兼容兜底，把媒体转换成客户端能够处理的格式。这条路径会使用 FFmpeg，只适用于 STRM 媒体；普通 Plex 媒体仍使用 Plex 自己的播放和转码流程。
 
+首页和媒体库元数据响应不会再逐个探测远程 STRM 源。详细的 FFprobe 媒体信息会延迟到播放准备阶段或启动转码时执行，并复用进程内的探测缓存。
+
 ## 前置条件
 
 - Plex Media Server 中已经能看到 `.strm` 媒体条目。
@@ -101,6 +103,28 @@ https://plex-proxy.example.com
 | `STRM_HLS_TRANSCODE` | `true` | 启用 STRM HLS 兼容兜底 |
 
 出于安全考虑，默认允许标准端口上的 HTTP/HTTPS 媒体 URL。私网目标和非标准端口默认禁止，必须显式启用。
+
+### 局域网自建媒体源
+
+一种常见做法是让 `.strm` 指向局域网内的自建服务，例如运行在同一台 NAS 上的 OpenList/alist。这时有两个配置项需要关注：
+
+- `ALLOW_PRIVATE_TARGETS=true` —— 代理默认拒绝私网媒体目标（SSRF 防护）。只有当 STRM URL 指向你自己的局域网地址时才应开启。
+- `--add-host media.example.com:192.168.1.10` —— 当 STRM 域名在容器内外解析结果不一致时需要。典型场景：域名走公网 CDN 代理（如 Cloudflare），而服务实际部署在局域网。容器使用路由器 DNS，它自身的出站流量（FFprobe 探测，以及 `proxy` 模式下的全部媒体流量）会解析到公网地址、绕行公网边缘节点。该参数把域名固定到局域网地址；由于固定后的地址是私网 IP，因此必须同时开启 `ALLOW_PRIVATE_TARGETS=true`。
+
+| STRM URL 指向 | 配置 |
+| --- | --- |
+| 公网地址（网盘链接、公网 alist） | 默认配置，无需额外设置 |
+| 局域网服务，域名对所有客户端都解析到局域网 IP | 只需 `ALLOW_PRIVATE_TARGETS=true` |
+| 局域网服务，域名走公网 CDN 代理 | `--add-host` 和 `ALLOW_PRIVATE_TARGETS=true` 都要加 |
+
+```bash
+docker run ... \
+  -e ALLOW_PRIVATE_TARGETS=true \
+  --add-host oplist.example.com:192.168.1.10 \
+  ghcr.io/stromkuo/plex-strm-proxy:latest
+```
+
+`redirect` 模式下客户端仍会自行解析媒体 URL，因此每台客户端也需要能正确解析该域名。如果部分客户端解析效果差，可以在路由器上添加本地 DNS 记录，或改用 `proxy` 模式 —— 媒体流量经过代理容器，只有代理自身的解析会影响播放。
 
 ## 限制
 
