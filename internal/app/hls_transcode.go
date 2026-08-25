@@ -33,6 +33,7 @@ const hlsSessionIdleTimeout = 3 * time.Minute
 type hlsSession struct {
 	id                string
 	sourceURL         string
+	sourceProxyURL    string
 	directory         string
 	width             int
 	height            int
@@ -124,7 +125,7 @@ func (t *hlsTranscoder) cleanupLoop() {
 	}
 }
 
-func (t *hlsTranscoder) register(rawID, sourceURL string, query url.Values, audioTranscode bool) (string, error) {
+func (t *hlsTranscoder) register(rawID, sourceURL, sourceProxyURL string, query url.Values, audioTranscode bool) (string, error) {
 	id, err := normalizeHLSSessionID(rawID)
 	if err != nil {
 		return "", err
@@ -139,7 +140,7 @@ func (t *hlsTranscoder) register(rawID, sourceURL string, query url.Values, audi
 	t.cleanupExpiredLocked(time.Now())
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
-		if existing.started && !existing.done && existing.sourceURL == sourceURL {
+		if existing.started && !existing.done && existing.sourceURL == sourceURL && existing.sourceProxyURL == sourceProxyURL {
 			existing.lastAccess = time.Now()
 			existing.mu.Unlock()
 			t.mu.Unlock()
@@ -163,6 +164,7 @@ func (t *hlsTranscoder) register(rawID, sourceURL string, query url.Values, audi
 	t.sessions[id] = &hlsSession{
 		id:             id,
 		sourceURL:      sourceURL,
+		sourceProxyURL: sourceProxyURL,
 		directory:      directory,
 		width:          width,
 		height:         height,
@@ -199,28 +201,45 @@ func (t *hlsTranscoder) start(ctx context.Context, id string) (string, error) {
 
 	session.mu.Lock()
 	if !session.started {
-		validatedURL, validationErr := ResolveMediaTarget(ctx, t.mediaClient, t.policy, session.sourceURL)
-		if validationErr != nil {
-			session.mu.Unlock()
-			return "", fmt.Errorf("HLS source is not allowed: %w", validationErr)
-		}
-		// Keep ffprobe and ffmpeg on the exact URL whose redirect chain was
-		// checked by TargetPolicy before the subprocess is started.
-		session.sourceURL = validatedURL
-		if duration, err := t.probeDuration(ctx, session.sourceURL); err == nil && duration > 0 {
-			session.duration = duration
-			if session.startOffset >= duration {
-				session.startOffset = math.Max(0, duration-5.0)
-			}
-			session.startSegment = int(math.Floor(session.startOffset / hlsSegmentDurationSeconds))
-			session.vod = true
-			if err := writeHLSVODPlaylist(filepath.Join(session.directory, "base", "index.m3u8"), duration); err != nil {
+		processURL := session.sourceURL
+		internalProxy := session.sourceProxyURL != ""
+		if internalProxy {
+			processURL = session.sourceProxyURL
+		} else {
+			validatedURL, validationErr := ResolveMediaTarget(ctx, t.mediaClient, t.policy, session.sourceURL)
+			if validationErr != nil {
 				session.mu.Unlock()
-				return "", fmt.Errorf("write HLS VOD playlist: %w", err)
+				return "", fmt.Errorf("HLS source is not allowed: %w", validationErr)
 			}
-			t.logger.Info("using known-duration HLS VOD playlist", "session", id, "duration_seconds", duration, "start_offset_seconds", session.startOffset, "start_segment", session.startSegment)
-		} else if err != nil {
-			t.logger.Warn("could not determine STRM media duration; using growing HLS playlist", "session", id, "error", err)
+			// Keep ffprobe and ffmpeg on the exact URL whose redirect chain was
+			// checked by TargetPolicy before the subprocess is started.
+			processURL = validatedURL
+			session.sourceURL = validatedURL
+		}
+		if !internalProxy {
+			if duration, err := t.probeDuration(ctx, processURL, false); err == nil && duration > 0 {
+				session.duration = duration
+				if session.startOffset >= duration {
+					session.startOffset = math.Max(0, duration-5.0)
+				}
+				session.startSegment = int(math.Floor(session.startOffset / hlsSegmentDurationSeconds))
+				session.vod = true
+				if err := writeHLSVODPlaylist(filepath.Join(session.directory, "base", "index.m3u8"), duration); err != nil {
+					session.mu.Unlock()
+					return "", fmt.Errorf("write HLS VOD playlist: %w", err)
+				}
+				t.logger.Info("using known-duration HLS VOD playlist", "session", id, "duration_seconds", duration, "start_offset_seconds", session.startOffset, "start_segment", session.startSegment)
+			} else if err != nil {
+				t.logger.Warn("could not determine STRM media duration; using growing HLS playlist", "session", id, "error", err)
+			}
+		} else {
+			// Protected-part sessions deliberately skip the blocking duration
+			// probe: the media is streamed through the proxy's own Part route,
+			// and a full extra source pass just to learn the duration would
+			// delay the first segment. Trade-off: the session keeps a growing
+			// playlist instead of a VOD one, so end-of-file seeking is not
+			// advertised until ffmpeg reports progress.
+			t.logger.Info("starting HLS without blocking duration probe", "session", id, "source", "protected-part")
 		}
 		session.copyAttempt = t.copyFirst
 		args := buildFFmpegArgs(session)
@@ -254,9 +273,11 @@ func (t *hlsTranscoder) start(ctx context.Context, id string) (string, error) {
 	return renderHLSMasterPlaylist(session), nil
 }
 
-func (t *hlsTranscoder) probeDuration(ctx context.Context, sourceURL string) (float64, error) {
-	if _, err := t.policy.ValidateRawURL(ctx, sourceURL); err != nil {
-		return 0, fmt.Errorf("ffprobe HLS source is not allowed: %w", err)
+func (t *hlsTranscoder) probeDuration(ctx context.Context, sourceURL string, internalProxy bool) (float64, error) {
+	if !internalProxy {
+		if _, err := t.policy.ValidateRawURL(ctx, sourceURL); err != nil {
+			return 0, fmt.Errorf("ffprobe HLS source is not allowed: %w", err)
+		}
 	}
 	probeContext, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -323,6 +344,9 @@ func (t *hlsTranscoder) hlsSourceAllowed(session *hlsSession) bool {
 	if session == nil || session.sourceFile != "" {
 		return session != nil
 	}
+	if session.sourceProxyURL != "" {
+		return true
+	}
 	_, err := t.policy.ValidateRawURL(context.Background(), session.sourceURL)
 	return err == nil
 }
@@ -388,7 +412,11 @@ func (t *hlsTranscoder) ensureSourceCached(session *hlsSession) error {
 
 func (t *hlsTranscoder) downloadSource(session *hlsSession, ready chan struct{}) {
 	defer close(ready)
-	container := mediaContainerForURL(session.sourceURL)
+	requestURL := session.sourceURL
+	if session.sourceProxyURL != "" {
+		requestURL = session.sourceProxyURL
+	}
+	container := mediaContainerForURL(requestURL)
 	if container == "" {
 		container = "media"
 	}
@@ -396,11 +424,11 @@ func (t *hlsTranscoder) downloadSource(session *hlsSession, ready chan struct{})
 	temporary := filename + ".part"
 	_ = os.Remove(temporary)
 
-	target, err := url.Parse(session.sourceURL)
-	if err == nil {
+	target, err := url.Parse(requestURL)
+	if err == nil && session.sourceProxyURL == "" {
 		err = t.policy.ValidateURL(context.Background(), target)
 	}
-	request, requestErr := http.NewRequest(http.MethodGet, session.sourceURL, nil)
+	request, requestErr := http.NewRequest(http.MethodGet, requestURL, nil)
 	if err == nil {
 		err = requestErr
 	}
@@ -409,7 +437,9 @@ func (t *hlsTranscoder) downloadSource(session *hlsSession, ready chan struct{})
 	}
 	var response *http.Response
 	if err == nil {
-		if t.mediaClient == nil {
+		if session.sourceProxyURL != "" {
+			response, err = http.DefaultClient.Do(request)
+		} else if t.mediaClient == nil {
 			err = fmt.Errorf("media client is not configured")
 		} else {
 			// Use the same policy-constrained client as direct media requests.
@@ -629,10 +659,13 @@ func buildFFmpegArgsForRange(session *hlsSession, startOffset float64, startSegm
 		videoBitrate = 256
 	}
 	source := session.sourceURL
+	if session.sourceProxyURL != "" {
+		source = session.sourceProxyURL
+	}
 	if session.sourceFile != "" {
 		source = session.sourceFile
 	}
-	localSource := source != session.sourceURL
+	localSource := session.sourceFile != ""
 	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
 	if startOffset > 0 && localSource {
 		args = append(args, "-ss", strconv.FormatFloat(startOffset, 'f', 3, 64))
@@ -843,6 +876,16 @@ func parseHLSResourcePath(requestPath string) (string, string, bool) {
 		return "", "", false
 	}
 	return parts[0], parts[1], true
+}
+
+// Plex Web can keep using the same session resource prefix for a DASH
+// fallback after the proxy has returned an HLS-shaped decision. In that case
+// resources such as 0/header and *.m4s belong to Plex's transcode session,
+// not to the proxy's filesystem-backed HLS session. Only claim resources that
+// this proxy actually produces.
+func isProxyOwnedHLSResource(relative string) bool {
+	lower := strings.ToLower(strings.TrimSpace(relative))
+	return strings.HasSuffix(lower, ".m3u8") || strings.HasSuffix(lower, ".ts")
 }
 
 func isHLSResourceRequest(requestPath string) bool {

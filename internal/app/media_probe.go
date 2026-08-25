@@ -147,21 +147,21 @@ func (value *flexibleInt) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func probeMedia(ctx context.Context, ffmpegPath, sourceURL string, policy TargetPolicy) (mediaProbe, error) {
+// probeMedia runs ffprobe against sourceURL. The caller must have validated
+// the URL and its redirect chain via ResolveMediaTarget first; ffprobe then
+// runs against the already-validated final URL without re-resolving.
+func probeMedia(ctx context.Context, ffmpegPath, sourceURL string) (mediaProbe, error) {
 	if strings.TrimSpace(ffmpegPath) == "" || strings.TrimSpace(sourceURL) == "" {
 		return mediaProbe{}, fmt.Errorf("ffmpeg path and source URL are required")
 	}
-	if _, err := policy.ValidateRawURL(ctx, sourceURL); err != nil {
-		return mediaProbe{}, fmt.Errorf("ffprobe media target is not allowed: %w", err)
-	}
-	probeContext, cancel := context.WithTimeout(ctx, 20*time.Second)
+	probeContext, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	probePath := filepath.Join(filepath.Dir(ffmpegPath), "ffprobe")
 	command := exec.CommandContext(probeContext, probePath,
 		"-v", "error",
 		"-probesize", "128000",
 		"-analyzeduration", "500000",
-		"-rw_timeout", "15000000",
+		"-rw_timeout", "30000000",
 		"-show_streams",
 		"-show_format",
 		"-of", "json",
@@ -558,32 +558,86 @@ func scanType(fieldOrder string) string {
 	}
 }
 
-func (s *Server) probeSTRMMedia(ctx context.Context, sourceURL string) (mediaProbe, bool) {
+// probeSTRMMediaForMapping probes the STRM source behind a known PartMapping.
+// The URL is validated end to end: runSTRMMediaProbe routes it through
+// ResolveMediaTarget (redirect chain plus TargetPolicy) before ffprobe runs,
+// so a redirect cannot point the subprocess at a disallowed host.
+func (s *Server) probeSTRMMediaForMapping(ctx context.Context, mapping PartMapping) (mediaProbe, bool) {
+	return s.probeSTRMMediaURL(ctx, mapping.ResolvedURL)
+}
+
+func (s *Server) cachedSTRMMediaProbeForMapping(mapping PartMapping) (mediaProbe, bool) {
+	sourceURL := strings.TrimSpace(mapping.ResolvedURL)
+	if sourceURL == "" {
+		return mediaProbe{}, false
+	}
+	s.probeMu.Lock()
+	entry, ok := s.probes[sourceURL]
+	if ok && !time.Now().Before(entry.expiresAt) {
+		delete(s.probes, sourceURL)
+		ok = false
+	}
+	s.probeMu.Unlock()
+	if !ok {
+		return mediaProbe{}, false
+	}
+	return entry.value, true
+}
+
+func (s *Server) probeSTRMMediaURL(ctx context.Context, sourceURL string) (mediaProbe, bool) {
 	sourceURL = strings.TrimSpace(sourceURL)
 	if sourceURL == "" {
 		return mediaProbe{}, false
 	}
-	now := time.Now()
+
 	s.probeMu.Lock()
-	if entry, ok := s.probes[sourceURL]; ok && now.Before(entry.expiresAt) {
+	if entry, ok := s.probes[sourceURL]; ok && time.Now().Before(entry.expiresAt) {
 		s.probeMu.Unlock()
 		return entry.value, true
 	}
+	if flight, ok := s.probeFlights[sourceURL]; ok {
+		s.probeMu.Unlock()
+		select {
+		case <-flight.done:
+			return flight.value, flight.ok
+		case <-ctx.Done():
+			return mediaProbe{}, false
+		}
+	}
+	flight := &mediaProbeFlight{done: make(chan struct{})}
+	s.probeFlights[sourceURL] = flight
 	s.probeMu.Unlock()
 
+	probe, ok := s.runSTRMMediaProbe(ctx, sourceURL)
+	s.probeMu.Lock()
+	if ok {
+		s.probes[sourceURL] = mediaProbeCacheEntry{value: probe, expiresAt: time.Now().Add(s.cfg.MappingCacheTTL)}
+	}
+	flight.value = probe
+	flight.ok = ok
+	delete(s.probeFlights, sourceURL)
+	close(flight.done)
+	s.probeMu.Unlock()
+	if !ok {
+		return mediaProbe{}, false
+	}
+	s.logger.Info("probed STRM media", "target_host", resolvedTargetHost(sourceURL), "duration_ms", int64(probe.Duration*1000), "stream_count", len(probe.Streams), "video_codec", probe.VideoCodec, "audio_codec", probe.AudioCodec)
+	return probe, true
+}
+
+// runSTRMMediaProbe resolves and validates the STRM URL's redirect chain
+// through ResolveMediaTarget before ffprobe sees it, keeping the subprocess
+// on the TargetPolicy-approved final URL.
+func (s *Server) runSTRMMediaProbe(ctx context.Context, sourceURL string) (mediaProbe, bool) {
 	validatedURL, err := ResolveMediaTarget(ctx, s.mediaClient, s.policy, sourceURL)
 	if err != nil {
 		s.logger.Warn("failed to validate STRM media target", "target_host", resolvedTargetHost(sourceURL), "error", err)
 		return mediaProbe{}, false
 	}
-	probe, err := probeMedia(ctx, s.cfg.FFmpegPath, validatedURL, s.policy)
+	probe, err := probeMedia(ctx, s.cfg.FFmpegPath, validatedURL)
 	if err != nil {
 		s.logger.Warn("failed to probe STRM media", "target_host", resolvedTargetHost(sourceURL), "error", err)
 		return mediaProbe{}, false
 	}
-	s.probeMu.Lock()
-	s.probes[sourceURL] = mediaProbeCacheEntry{value: probe, expiresAt: now.Add(s.cfg.MappingCacheTTL)}
-	s.probeMu.Unlock()
-	s.logger.Info("probed STRM media", "target_host", resolvedTargetHost(sourceURL), "duration_ms", int64(probe.Duration*1000), "stream_count", len(probe.Streams), "video_codec", probe.VideoCodec, "audio_codec", probe.AudioCodec)
 	return probe, true
 }

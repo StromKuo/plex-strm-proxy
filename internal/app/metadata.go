@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type metadataPartLookup struct {
@@ -18,6 +19,18 @@ type metadataPartLookup struct {
 	ContentType string
 	Body        []byte
 }
+
+type metadataPartLookupCacheEntry struct {
+	lookup    metadataPartLookup
+	expiresAt time.Time
+}
+
+const metadataPartLookupTTL = 30 * time.Second
+
+// metadataPartLookupMaxEntries bounds the metadata part lookup cache. Entries
+// hold full metadata bodies, so the cache is reset once it grows past this
+// many distinct (path, media, part) keys.
+const metadataPartLookupMaxEntries = 256
 
 func (s *Server) lookupMetadataPart(ctx context.Context, source *http.Request, metadataPath string) (PartMapping, error) {
 	lookup, err := s.lookupMetadataPartSnapshot(ctx, source, metadataPath)
@@ -35,6 +48,9 @@ func (s *Server) lookupMetadataPartSnapshot(ctx context.Context, source *http.Re
 	partIndex, err := queryIndex(source.URL.Query(), "partIndex")
 	if err != nil {
 		return metadataPartLookup{}, err
+	}
+	if lookup, ok := s.cachedMetadataPartLookup(metadataPath, mediaIndex, partIndex); ok {
+		return lookup, nil
 	}
 
 	metadataURL := *s.cfg.PlexUpstream
@@ -89,10 +105,88 @@ func (s *Server) lookupMetadataPartSnapshot(ctx context.Context, source *http.Re
 	s.mappings.IngestStructuredResponse(response.Header.Get("Content-Type"), decoded, "", s.resolver)
 	for _, partID := range mappingPartIDs(record) {
 		if mapping, ok := s.mappings.Get(partID); ok {
-			return metadataPartLookup{Mapping: mapping, ContentType: response.Header.Get("Content-Type"), Body: decoded}, nil
+			lookup := metadataPartLookup{Mapping: mapping, ContentType: response.Header.Get("Content-Type"), Body: decoded}
+			s.rememberMetadataPartLookups(metadataPath, lookup.ContentType, decoded)
+			return lookup, nil
 		}
 	}
 	return metadataPartLookup{}, fmt.Errorf("metadata Part has no usable id: mediaIndex=%d partIndex=%d", mediaIndex, partIndex)
+}
+
+func metadataPartLookupKey(metadataPath string, mediaIndex, partIndex int) string {
+	return fmt.Sprintf("%s\x00%d\x00%d", metadataPath, mediaIndex, partIndex)
+}
+
+func (s *Server) cachedMetadataPartLookup(metadataPath string, mediaIndex, partIndex int) (metadataPartLookup, bool) {
+	key := metadataPartLookupKey(metadataPath, mediaIndex, partIndex)
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
+	entry, ok := s.metadataLookups[key]
+	if !ok {
+		return metadataPartLookup{}, false
+	}
+	if !time.Now().Before(entry.expiresAt) {
+		delete(s.metadataLookups, key)
+		return metadataPartLookup{}, false
+	}
+	return entry.lookup, true
+}
+
+func (s *Server) rememberMetadataPartLookups(metadataPath, contentType string, body []byte) {
+	if metadataPath == "" || len(body) == 0 {
+		return
+	}
+	indexed := extractIndexedPartRecords(contentType, body)
+	if len(indexed) == 0 {
+		return
+	}
+	ttl := metadataPartLookupTTL
+	if s.cfg.MappingCacheTTL < ttl {
+		ttl = s.cfg.MappingCacheTTL
+	}
+	expiresAt := time.Now().Add(ttl)
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
+	s.pruneMetadataLookupsLocked(time.Now())
+	if len(s.metadataLookups) >= metadataPartLookupMaxEntries {
+		// Short-TTL lookup cache: a wholesale reset bounds memory without
+		// LRU bookkeeping when many distinct metadata paths are seen at once.
+		s.metadataLookups = make(map[string]metadataPartLookupCacheEntry)
+	}
+	for mediaIndex, parts := range indexed {
+		for partIndex, record := range parts {
+			var mapping PartMapping
+			found := false
+			for _, partID := range mappingPartIDs(record) {
+				if value, ok := s.mappings.Get(partID); ok {
+					mapping = value
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+			key := metadataPartLookupKey(metadataPath, mediaIndex, partIndex)
+			s.metadataLookups[key] = metadataPartLookupCacheEntry{
+				lookup: metadataPartLookup{
+					Mapping:     mapping,
+					ContentType: contentType,
+					Body:        body,
+				},
+				expiresAt: expiresAt,
+			}
+		}
+	}
+}
+
+// pruneMetadataLookupsLocked drops expired metadata part lookups.
+func (s *Server) pruneMetadataLookupsLocked(now time.Time) {
+	for key, entry := range s.metadataLookups {
+		if !now.Before(entry.expiresAt) {
+			delete(s.metadataLookups, key)
+		}
+	}
 }
 
 func queryIndex(query url.Values, name string) (int, error) {

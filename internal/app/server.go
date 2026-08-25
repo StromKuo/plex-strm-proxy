@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,13 +45,30 @@ type Server struct {
 	decisionMu      sync.Mutex
 	directDecisions map[string]directDecision
 	directByPart    map[string]directDecision
+	metadataMu      sync.Mutex
+	metadataLookups map[string]metadataPartLookupCacheEntry
 	probeMu         sync.Mutex
 	probes          map[string]mediaProbeCacheEntry
+	probeFlights    map[string]*mediaProbeFlight
 }
 
 type directDecision struct {
-	mapping   PartMapping
-	expiresAt time.Time
+	mapping      PartMapping
+	metadataPath string
+	contentType  string
+	body         []byte
+	createdAt    time.Time
+	expiresAt    time.Time
+}
+
+// mediaProbeFlight coalesces the first direct-play probe with the follow-up
+// decision request. The first decision is allowed to return immediately while
+// the second decision waits for the same probe instead of starting a duplicate
+// probe or deferring it to start.mpd.
+type mediaProbeFlight struct {
+	done  chan struct{}
+	value mediaProbe
+	ok    bool
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -88,7 +106,9 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		logger:          logger,
 		directDecisions: make(map[string]directDecision),
 		directByPart:    make(map[string]directDecision),
+		metadataLookups: make(map[string]metadataPartLookupCacheEntry),
 		probes:          make(map[string]mediaProbeCacheEntry),
+		probeFlights:    make(map[string]*mediaProbeFlight),
 	}
 	if cfg.HLSTranscode {
 		server.hls, err = newHLSTranscoder(cfg.TranscodeRoot, cfg.FFmpegPath, cfg.TranscodeTTL, cfg.HLSCopyFirst, policy, server.mediaClient, logger)
@@ -172,7 +192,18 @@ func (s *Server) handleDecision(writer http.ResponseWriter, request *http.Reques
 				writeJSONError(writer, http.StatusBadGateway, "STRM URL could not be resolved")
 				return
 			}
-			plan, probe := s.selectPlaybackPlan(request, mapping, PlaybackStageMetadata, PlexDecisionUnknown, false)
+			// Replay the remembered direct decision only for the same session
+			// and only when the client explicitly asked for transcode. A
+			// part-keyed replay would force direct play onto other clients
+			// that genuinely need a transcode for this Part.
+			if sessionID := hlsSessionIDFromRequest(request); sessionID != "" && request.URL.Query().Get("directPlay") == "0" && request.URL.Query().Get("directStream") == "0" {
+				if decision, ok := s.directDecisionRecord(sessionID); ok && decision.mapping.PartID == mapping.PartID && len(decision.body) > 0 {
+					s.logger.Info("returning cached STRM direct decision", "request_id", requestID(request.Context()), "part_id", mapping.PartID, "metadata_path", metadataPath, "session", sessionID)
+					writeCachedDirectDecision(writer, request, decision)
+					return
+				}
+			}
+			plan, probe := s.selectPlaybackPlan(request, mapping, PlaybackStageDecisionRequest, PlexDecisionUnknown, false)
 			if plan.Plan == PlaybackPlanPlexTranscode && plan.Reason == PlaybackReasonProxyHLSDisabled {
 				writeJSONError(writer, http.StatusNotImplemented, "STRM HLS fallback is disabled")
 				return
@@ -270,6 +301,24 @@ func playbackPathKind(value string) string {
 func (s *Server) handleTranscodeStart(writer http.ResponseWriter, request *http.Request) {
 	metadataPath, ok := parseMetadataPath(request.URL.Query().Get("path"))
 	if !ok || !s.cfg.DecisionRewrite {
+		// Plex Web can send the direct source URL back in start.mpd after the
+		// direct-first decision, even though this is now a transcode request.
+		// Rebind that fallback to the protected Part endpoint so Plex does not
+		// receive the third-party URL or append its token to it.
+		if request.URL.Query().Get("plexTranscode") == "1" && s.hls != nil {
+			if decision, found := s.directDecisionRecordForStart(hlsSessionIDFromRequest(request), ""); found && decision.mapping.Kind == PartKindSTRM && decision.metadataPath != "" {
+				query := prepareSTRMPlaybackQuery(request)
+				query.Set("path", s.metadataProxyURL(request, decision.metadataPath, decision.mapping.PartID))
+				query.Set("plexTranscode", "1")
+				clonedURL := *request.URL
+				clonedURL.RawQuery = query.Encode()
+				startRequest := request.Clone(request.Context())
+				startRequest.URL = &clonedURL
+				s.logger.Info("rebinding STRM transcode fallback through protected metadata", "request_id", requestID(request.Context()), "metadata_path", decision.metadataPath, "part_id", decision.mapping.PartID, "session", hlsSessionIDFromRequest(request))
+				s.proxyToPlex(writer, startRequest, decision.mapping.STRMPath)
+				return
+			}
+		}
 		s.proxyToPlex(writer, request, "")
 		return
 	}
@@ -293,6 +342,11 @@ func (s *Server) handleTranscodeStart(writer http.ResponseWriter, request *http.
 	s.logger.Info("STRM transcode start request", "request_id", requestID(request.Context()), "metadata_path", metadataPath, "part_id", mapping.PartID, "protocol", request.URL.Query().Get("protocol"), "direct_play", request.URL.Query().Get("directPlay"), "direct_stream", request.URL.Query().Get("directStream"), "session", sessionID, "location", request.URL.Query().Get("location"))
 
 	if isHLSStartRequest(request) {
+		if _, ok := s.hls.session(sessionID); ok {
+			s.logger.Info("starting registered STRM HLS transcode", "request_id", requestID(request.Context()), "metadata_path", metadataPath, "part_id", mapping.PartID, "session", sessionID)
+			s.handleHLSTranscodeStart(writer, request, sessionID)
+			return
+		}
 		// Android may ask for an HLS start URL even after the preceding
 		// decision response was rewritten to directplay (observed with
 		// directPlay=0&directStream=1). Once that decision is known, the
@@ -315,11 +369,6 @@ func (s *Server) handleTranscodeStart(writer http.ResponseWriter, request *http.
 			s.proxyToPlex(writer, request, "")
 			return
 		}
-		if _, ok := s.hls.session(sessionID); ok {
-			s.logger.Info("starting STRM HLS transcode", "request_id", requestID(request.Context()), "metadata_path", metadataPath, "part_id", mapping.PartID, "session", sessionID, "plan", plan.Plan, "reason", plan.Reason)
-			s.handleHLSTranscodeStart(writer, request, sessionID)
-			return
-		}
 		registeredID, registerErr := s.registerHLSTranscode(request, mapping)
 		if registerErr != nil {
 			s.logger.Warn("failed to register STRM HLS transcode at start", "request_id", requestID(request.Context()), "part_id", mapping.PartID, "error", registerErr)
@@ -330,13 +379,53 @@ func (s *Server) handleTranscodeStart(writer http.ResponseWriter, request *http.
 		return
 	}
 	query := prepareSTRMPlaybackQuery(request)
-	query.Set("path", mapping.ResolvedURL)
-	s.logger.Info("forwarding STRM transcode start to Plex", "request_id", requestID(request.Context()), "metadata_path", metadataPath, "part_id", mapping.PartID, "target_host", resolvedTargetHost(mapping.ResolvedURL))
+	if s.hls != nil {
+		if _, ok := s.hls.session(sessionID); ok {
+			query.Set("path", s.metadataProxyURL(request, metadataPath, mapping.PartID))
+			query.Set("plexTranscode", "1")
+			s.logger.Info("forwarding DASH fallback to Plex through protected metadata", "request_id", requestID(request.Context()), "metadata_path", metadataPath, "part_id", mapping.PartID)
+		} else {
+			query.Set("path", mapping.ResolvedURL)
+			s.logger.Info("forwarding STRM transcode start to Plex", "request_id", requestID(request.Context()), "metadata_path", metadataPath, "part_id", mapping.PartID, "target_host", resolvedTargetHost(mapping.ResolvedURL))
+		}
+	} else {
+		query.Set("path", mapping.ResolvedURL)
+		s.logger.Info("forwarding STRM transcode start to Plex", "request_id", requestID(request.Context()), "metadata_path", metadataPath, "part_id", mapping.PartID, "target_host", resolvedTargetHost(mapping.ResolvedURL))
+	}
 	clonedURL := *request.URL
 	clonedURL.RawQuery = query.Encode()
 	startRequest := request.Clone(request.Context())
 	startRequest.URL = &clonedURL
 	s.proxyToPlex(writer, startRequest, mapping.STRMPath)
+}
+
+func (s *Server) metadataProxyURL(request *http.Request, metadataPath, partID string) string {
+	query := url.Values{"plexTranscode": {"1"}}
+	if strings.TrimSpace(partID) != "" {
+		query.Set("plexPartID", partID)
+	}
+	return s.publicProxyURL(request, metadataPath, query.Encode())
+}
+
+func (s *Server) partProxyURL(request *http.Request, partID string) string {
+	return s.publicProxyURL(request, "/library/parts/"+url.PathEscape(partID)+"/file", "plexTranscode=1")
+}
+
+func (s *Server) publicProxyURL(request *http.Request, endpointPath, rawQuery string) string {
+	scheme := strings.TrimSpace(request.Header.Get("X-Forwarded-Proto"))
+	if scheme == "" {
+		scheme = "http"
+	}
+	host := strings.TrimSpace(request.Host)
+	if host == "" {
+		host = s.cfg.ListenAddr
+	}
+	return (&url.URL{
+		Scheme:   scheme,
+		Host:     host,
+		Path:     endpointPath,
+		RawQuery: rawQuery,
+	}).String()
 }
 
 func (s *Server) registerHLSTranscode(request *http.Request, mapping PartMapping) (string, error) {
@@ -345,15 +434,38 @@ func (s *Server) registerHLSTranscode(request *http.Request, mapping PartMapping
 	}
 	plan, _ := s.selectPlaybackPlan(request, mapping, PlaybackStageTranscodeStart, PlexDecisionTranscode, false)
 	audioTranscode := plan.Plan == PlaybackPlanProxyHLSAudioFallback
-	validatedURL, err := ResolveMediaTarget(request.Context(), s.mediaClient, s.policy, mapping.ResolvedURL)
-	if err != nil {
-		return "", fmt.Errorf("validate STRM HLS source: %w", err)
+	return s.hls.register(hlsSessionIDFromRequest(request), mapping.ResolvedURL, s.localPartProxyURL(mapping.PartID), request.URL.Query(), audioTranscode)
+}
+
+// localPartProxyURL builds the loopback URL that in-process media consumers
+// (ffprobe, ffmpeg, the HLS downloader) use to fetch a protected Part. The
+// host mirrors the configured listener: a wildcard bind still reaches the
+// process via loopback, while an explicit interface bind must be reused
+// because loopback would not be served.
+func (s *Server) localPartProxyURL(partID string) string {
+	host := "127.0.0.1"
+	port := "3001"
+	if listenHost, listenPort, err := net.SplitHostPort(s.cfg.ListenAddr); err == nil {
+		if listenPort != "" {
+			port = listenPort
+		}
+		switch listenHost {
+		case "", "0.0.0.0", "::", "[::]":
+			// Wildcard listener: loopback is always reachable in-process.
+		default:
+			host = listenHost
+		}
 	}
-	return s.hls.register(hlsSessionIDFromRequest(request), validatedURL, request.URL.Query(), audioTranscode)
+	return (&url.URL{
+		Scheme:   "http",
+		Host:     net.JoinHostPort(host, port),
+		Path:     "/library/parts/" + url.PathEscape(partID) + "/file",
+		RawQuery: "plexTranscode=1",
+	}).String()
 }
 
 func (s *Server) handleHLSTranscodeStart(writer http.ResponseWriter, request *http.Request, sessionID string) {
-	playlist, err := s.hls.start(request.Context(), sessionID)
+	playlist, err := s.hls.start(context.WithoutCancel(request.Context()), sessionID)
 	if err != nil {
 		s.logger.Warn("failed to start STRM HLS transcode", "request_id", requestID(request.Context()), "session", sessionID, "error", err)
 		writeJSONError(writer, http.StatusBadGateway, "STRM HLS transcode unavailable")
@@ -371,6 +483,13 @@ func (s *Server) handleHLSResource(writer http.ResponseWriter, request *http.Req
 	}
 	sessionID, relative, ok := parseHLSResourcePath(request.URL.Path)
 	if !ok || s.hls == nil {
+		s.proxyToPlex(writer, request, "")
+		return
+	}
+	if !isProxyOwnedHLSResource(relative) {
+		// A DASH fallback may use the same Plex session resource prefix. Let
+		// Plex serve its init/header/segment resources instead of waiting for
+		// files that only exist in the proxy's HLS directory.
 		s.proxyToPlex(writer, request, "")
 		return
 	}
@@ -450,6 +569,20 @@ func writeHLSTranscodeDecision(writer http.ResponseWriter, request *http.Request
 </MediaContainer>`, sessionID, metadataPath, mapping.PartID, bitrate, width, height, mapping.PartID, hlsPartKey(sessionID), width, height, width, height)
 }
 
+func writeCachedDirectDecision(writer http.ResponseWriter, request *http.Request, decision directDecision) {
+	contentType := decision.contentType
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/xml; charset=utf-8"
+	}
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Content-Type", contentType)
+	writer.Header().Set("Content-Length", strconv.Itoa(len(decision.body)))
+	writer.Header().Set("X-Plex-Strm-Proxy", "direct-cache")
+	setMediaCORSHeaders(writer, request)
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(decision.body)
+}
+
 func (s *Server) handlePartFile(writer http.ResponseWriter, request *http.Request) {
 	if request.Method == http.MethodOptions {
 		setMediaCORSHeaders(writer, request)
@@ -488,6 +621,10 @@ func (s *Server) handlePartFile(writer http.ResponseWriter, request *http.Reques
 	if err := s.policy.ValidateURL(request.Context(), target); err != nil {
 		s.logger.Warn("media target rejected", "request_id", requestID(request.Context()), "part_id", partID, "target_host", target.Hostname(), "error", err)
 		writeJSONError(writer, http.StatusBadGateway, "media target is not allowed")
+		return
+	}
+	if request.URL.Query().Get("plexTranscode") == "1" {
+		s.proxyMedia(writer, request, target)
 		return
 	}
 
@@ -549,6 +686,13 @@ func (s *Server) proxyMedia(writer http.ResponseWriter, request *http.Request, t
 		prefix = buffer[:count]
 	}
 	copyMediaResponseHeaders(writer.Header(), response.Header)
+	// Plex's internal DASH transcode fetch treats an unbounded 200 response's
+	// huge Content-Length as an allocation hint. Keep ordinary media and Range
+	// responses transparent, but let the protected Part route stream an
+	// unbounded source instead of advertising the whole remote file size.
+	if request.URL.Query().Get("plexTranscode") == "1" && request.Header.Get("Range") == "" && response.StatusCode == http.StatusOK {
+		writer.Header().Del("Content-Length")
+	}
 	setMediaCORSHeaders(writer, request)
 	if detectedType := detectMediaContentType(prefix, target); detectedType != "" {
 		writer.Header().Set("Content-Type", detectedType)
@@ -723,14 +867,16 @@ func (s *Server) modifyPlexResponse(response *http.Response) error {
 		}
 		s.ingestPlexStructuredResponse(responseRequestID, contentType, decoded, defaultSTRMPath)
 		s.rememberDirectDecision(response.Request, contentType, decoded)
+		s.rememberMetadataPartLookups(response.Request.URL.Path, contentType, decoded)
 		// Plex Web uses the declared container to choose the playback branch.
 		// Keep the STRM compatibility declaration that selects direct play; the
 		// media handler below corrects the actual Content-Type from the bytes.
-		rewritten, changed, err := s.rewriteSTRMMetadataResponse(response.Request, contentType, decoded, isDetailedMetadataResponse(response.Request))
+		probeMedia := response.Request != nil && response.Request.URL != nil && response.Request.URL.Query().Get("plexTranscode") == "1"
+		rewritten, changed, err := s.rewriteSTRMMetadataResponse(response.Request, contentType, decoded, probeMedia)
 		if err != nil {
 			return fmt.Errorf("rewrite Plex STRM metadata: %w", err)
 		}
-		s.logger.Info("Plex metadata response inspected", "request_id", responseRequestID, "path", response.Request.URL.Path, "accept", response.Request.Header.Get("Accept"), "content_type", contentType, "content_encoding", contentEncoding, "decoded_bytes", len(decoded), "rewritten_bytes", len(rewritten), "changed", changed, "probe_media", isDetailedMetadataResponse(response.Request))
+		s.logger.Info("Plex metadata response inspected", "request_id", responseRequestID, "path", response.Request.URL.Path, "accept", response.Request.Header.Get("Accept"), "content_type", contentType, "content_encoding", contentEncoding, "decoded_bytes", len(decoded), "rewritten_bytes", len(rewritten), "changed", changed, "probe_media", probeMedia)
 		if changed {
 			body, err = encodeStructuredBody(contentEncoding, rewritten)
 			if err != nil {
@@ -789,6 +935,7 @@ func (s *Server) rewriteSTRMMetadataResponse(source *http.Request, contentType s
 	if source != nil {
 		ctx = source.Context()
 	}
+	transcodeMetadata := source != nil && source.URL != nil && source.URL.Query().Get("plexTranscode") == "1"
 	directAllowed := func(part partRecord) bool {
 		mapping, ok := s.mappings.Get(part.ID)
 		if !ok || mapping.Kind != PartKindSTRM || mapping.ResolvedURL == "" {
@@ -819,11 +966,21 @@ func (s *Server) rewriteSTRMMetadataResponse(source *http.Request, contentType s
 		if !ok || mapping.Kind != PartKindSTRM {
 			return ""
 		}
+		if transcodeMetadata {
+			return s.partProxyURL(source, mapping.PartID)
+		}
 		return mapping.ResolvedURL
 	}
 	var probeFor metadataProbeFunc
 	if probeMedia {
+		selectedPartID := ""
+		if source != nil && source.URL != nil {
+			selectedPartID = strings.TrimSpace(source.URL.Query().Get("plexPartID"))
+		}
 		probeFor = func(part partRecord) *mediaProbe {
+			if selectedPartID != "" && part.ID != selectedPartID {
+				return nil
+			}
 			if !directAllowed(part) {
 				return nil
 			}
@@ -831,7 +988,11 @@ func (s *Server) rewriteSTRMMetadataResponse(source *http.Request, contentType s
 			if !ok || mapping.Kind != PartKindSTRM || mapping.ResolvedURL == "" {
 				return nil
 			}
-			probe, ok := s.probeSTRMMedia(ctx, mapping.ResolvedURL)
+			// The playback decision starts the probe in the background. Do not
+			// make Plex's start.mpd request wait for a cold remote probe; when it
+			// is not ready yet, Plex keeps its original metadata and performs its
+			// normal source inspection/transcode flow.
+			probe, ok := s.cachedSTRMMediaProbeForMapping(mapping)
 			if !ok {
 				return nil
 			}
@@ -839,14 +1000,6 @@ func (s *Server) rewriteSTRMMetadataResponse(source *http.Request, contentType s
 		}
 	}
 	return rewriteSTRMMetadataWithContainerAndFileAndProbe(contentType, body, containerFor, fileFor, probeFor)
-}
-
-func isDetailedMetadataResponse(request *http.Request) bool {
-	if request == nil || request.URL == nil {
-		return false
-	}
-	_, ok := parseMetadataPath(request.URL.Path)
-	return ok
 }
 
 func mediaContainerForURL(sourceURL string) string {
@@ -862,6 +1015,10 @@ func mediaContainerForURL(sourceURL string) string {
 		return ""
 	}
 }
+
+// directDecisionSessionLimit bounds how many remembered direct decisions
+// (which include full response bodies) are kept at once.
+const directDecisionSessionLimit = 128
 
 func (s *Server) rememberDirectDecision(request *http.Request, contentType string, body []byte) {
 	if request == nil || !isDecisionRequest(request) || !decisionBodyIsDirect(contentType, body) {
@@ -882,8 +1039,12 @@ func (s *Server) rememberDirectDecision(request *http.Request, contentType strin
 				continue
 			}
 			s.decisionMu.Lock()
-			s.directDecisions[sessionID] = directDecision{mapping: mapping, expiresAt: time.Now().Add(s.cfg.MappingCacheTTL)}
-			s.directByPart[mapping.PartID] = directDecision{mapping: mapping, expiresAt: time.Now().Add(s.cfg.MappingCacheTTL)}
+			now := time.Now()
+			metadataPath, _ := parseMetadataPath(request.URL.Query().Get("path"))
+			decision := directDecision{mapping: mapping, metadataPath: metadataPath, contentType: contentType, body: append([]byte(nil), body...), createdAt: now, expiresAt: now.Add(s.cfg.MappingCacheTTL)}
+			s.directDecisions[sessionID] = decision
+			s.directByPart[mapping.PartID] = decision
+			s.pruneDirectDecisionsLocked(now)
 			s.decisionMu.Unlock()
 			s.logger.Info("remembered direct STRM decision", "request_id", requestID(request.Context()), "session", sessionID, "part_id", mapping.PartID, "target_host", resolvedTargetHost(mapping.ResolvedURL))
 			return
@@ -891,41 +1052,93 @@ func (s *Server) rememberDirectDecision(request *http.Request, contentType strin
 	}
 }
 
+// pruneDirectDecisionsLocked drops expired records from both direct-decision
+// views and, while a view still exceeds directDecisionSessionLimit, evicts
+// the oldest entries so the caches stay bounded.
+func (s *Server) pruneDirectDecisionsLocked(now time.Time) {
+	for sessionID, decision := range s.directDecisions {
+		if now.After(decision.expiresAt) {
+			delete(s.directDecisions, sessionID)
+		}
+	}
+	for partID, decision := range s.directByPart {
+		if now.After(decision.expiresAt) {
+			delete(s.directByPart, partID)
+		}
+	}
+	for len(s.directDecisions) > directDecisionSessionLimit {
+		oldestSession := ""
+		var oldestAt time.Time
+		for sessionID, decision := range s.directDecisions {
+			if oldestSession == "" || decision.createdAt.Before(oldestAt) {
+				oldestSession, oldestAt = sessionID, decision.createdAt
+			}
+		}
+		delete(s.directDecisions, oldestSession)
+	}
+	for len(s.directByPart) > directDecisionSessionLimit {
+		oldestPart := ""
+		var oldestAt time.Time
+		for partID, decision := range s.directByPart {
+			if oldestPart == "" || decision.createdAt.Before(oldestAt) {
+				oldestPart, oldestAt = partID, decision.createdAt
+			}
+		}
+		delete(s.directByPart, oldestPart)
+	}
+}
+
 func (s *Server) directDecisionForStart(sessionID, partID string) (PartMapping, bool) {
-	if mapping, ok := s.directDecision(sessionID); ok {
-		return mapping, true
-	}
-	if partID == "" {
-		return PartMapping{}, false
-	}
-	s.decisionMu.Lock()
-	defer s.decisionMu.Unlock()
-	decision, ok := s.directByPart[partID]
+	decision, ok := s.directDecisionRecordForStart(sessionID, partID)
 	if !ok {
-		return PartMapping{}, false
-	}
-	if time.Now().After(decision.expiresAt) {
-		delete(s.directByPart, partID)
 		return PartMapping{}, false
 	}
 	return decision.mapping, true
 }
 
+func (s *Server) directDecisionRecordForStart(sessionID, partID string) (directDecision, bool) {
+	if decision, ok := s.directDecisionRecord(sessionID); ok {
+		return decision, true
+	}
+	if partID == "" {
+		return directDecision{}, false
+	}
+	s.decisionMu.Lock()
+	defer s.decisionMu.Unlock()
+	decision, ok := s.directByPart[partID]
+	if !ok {
+		return directDecision{}, false
+	}
+	if time.Now().After(decision.expiresAt) {
+		delete(s.directByPart, partID)
+		return directDecision{}, false
+	}
+	return decision, true
+}
+
 func (s *Server) directDecision(sessionID string) (PartMapping, bool) {
-	if sessionID == "" {
+	decision, ok := s.directDecisionRecord(sessionID)
+	if !ok {
 		return PartMapping{}, false
+	}
+	return decision.mapping, true
+}
+
+func (s *Server) directDecisionRecord(sessionID string) (directDecision, bool) {
+	if sessionID == "" {
+		return directDecision{}, false
 	}
 	s.decisionMu.Lock()
 	defer s.decisionMu.Unlock()
 	decision, ok := s.directDecisions[sessionID]
 	if !ok {
-		return PartMapping{}, false
+		return directDecision{}, false
 	}
 	if time.Now().After(decision.expiresAt) {
 		delete(s.directDecisions, sessionID)
-		return PartMapping{}, false
+		return directDecision{}, false
 	}
-	return decision.mapping, true
+	return decision, true
 }
 
 func decisionBodyIsDirect(contentType string, body []byte) bool {

@@ -35,6 +35,7 @@ type PlaybackStage uint8
 
 const (
 	PlaybackStageMetadata PlaybackStage = iota
+	PlaybackStageDecisionRequest
 	PlaybackStageDecisionResponse
 	PlaybackStageTranscodeStart
 )
@@ -68,8 +69,8 @@ func (s *Server) selectPlaybackPlan(request *http.Request, mapping PartMapping, 
 	query := request.URL.Query()
 	intent := playbackIntent(query.Get("directPlay"), query.Get("directStream"))
 	var probe *mediaProbe
-	if mapping.Kind == PartKindSTRM && mapping.ResolvedURL != "" && !directConfirmed && !intent.DirectPlay {
-		if value, ok := s.probeSTRMMedia(request.Context(), mapping.ResolvedURL); ok {
+	if mapping.Kind == PartKindSTRM && mapping.ResolvedURL != "" && playbackStageAllowsProbe(stage) && !directConfirmed && !intent.DirectPlay {
+		if value, ok := s.probeSTRMMediaForMapping(request.Context(), mapping); ok {
 			probe = &value
 		}
 	}
@@ -84,6 +85,10 @@ func (s *Server) selectPlaybackPlan(request *http.Request, mapping PartMapping, 
 		DirectPlayConfirmed: directConfirmed,
 	})
 	return result, probe
+}
+
+func playbackStageAllowsProbe(stage PlaybackStage) bool {
+	return stage != PlaybackStageMetadata
 }
 
 type PlaybackPolicyResult struct {

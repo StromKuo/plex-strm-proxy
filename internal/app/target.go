@@ -141,7 +141,7 @@ func ResolveMediaTarget(ctx context.Context, client *http.Client, policy TargetP
 	if err != nil {
 		return "", err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, target.String(), nil)
 	if err != nil {
 		return "", fmt.Errorf("create media validation request: %w", err)
 	}
@@ -154,6 +154,27 @@ func ResolveMediaTarget(ctx context.Context, client *http.Client, policy TargetP
 			return "", fmt.Errorf("validate media target redirects: %w", urlErr.Err)
 		}
 		return "", fmt.Errorf("validate media target redirects: request failed")
+	}
+	// Some media servers reject HEAD outright (405/501) or mishandle it into a
+	// client error (400/403). Retry validation with a 1-byte ranged GET, which
+	// every Range-capable media host supports, before giving up.
+	switch response.StatusCode {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		_ = response.Body.Close()
+		request, err = http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+		if err != nil {
+			return "", fmt.Errorf("create media validation fallback request: %w", err)
+		}
+		request.Header.Set("Range", "bytes=0-0")
+		request.Header.Set("User-Agent", "plex-strm-proxy/1.0")
+		response, err = client.Do(request)
+		if err != nil {
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) && urlErr.Err != nil {
+				return "", fmt.Errorf("validate media target redirects: %w", urlErr.Err)
+			}
+			return "", fmt.Errorf("validate media target redirects: request failed")
+		}
 	}
 	defer response.Body.Close()
 	if response.StatusCode >= http.StatusMultipleChoices && response.StatusCode < http.StatusBadRequest {

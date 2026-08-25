@@ -233,6 +233,276 @@ func TestHubResponseRewritesSTRMMetadata(t *testing.T) {
 	if _, ok := server.app.mappings.Get("321"); !ok {
 		t.Fatal("hub response did not index the STRM part mapping")
 	}
+	if cachedProbeCount(server.app) != 0 {
+		t.Fatalf("hub metadata unexpectedly probed STRM media: %d cached probes", cachedProbeCount(server.app))
+	}
+}
+
+func TestPlaybackDecisionProbesSTRMAfterMetadataRewrite(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(writer, "media")
+	}))
+	defer media.Close()
+
+	tools := t.TempDir()
+	ffprobePath := filepath.Join(tools, "ffprobe")
+	ffprobeScript := `#!/bin/sh
+cat <<'EOF'
+{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"1"}}
+EOF
+`
+	if err := os.WriteFile(ffprobePath, []byte(ffprobeScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	upstream, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.PlexUpstream = upstream
+	cfg.STRMRoots = []string{root}
+	cfg.AllowPrivate = true
+	cfg.AllowedPorts = nil
+	cfg.FFmpegPath = filepath.Join(tools, "ffmpeg")
+	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mapping := PartMapping{
+		PartID:      "321",
+		Kind:        PartKindSTRM,
+		STRMPath:    "/media/movie.strm",
+		ResolvedURL: media.URL + "/movie.mp4",
+	}
+	server.mappings.Put(mapping)
+	request := httptest.NewRequest(http.MethodGet, "http://proxy.test/hubs/continueWatching", nil)
+	body := []byte(`<MediaContainer><Video><Media><Part id="321" file="/media/movie.strm" /></Media></Video></MediaContainer>`)
+
+	rewritten, changed, err := server.rewriteSTRMMetadataResponse(request, "application/xml", body, false)
+	if err != nil || !changed || !strings.Contains(string(rewritten), `container="mp4"`) {
+		t.Fatalf("metadata rewrite failed: changed=%v err=%v body=%s", changed, err, rewritten)
+	}
+	if got := cachedProbeCount(server); got != 0 {
+		t.Fatalf("metadata rewrite probed STRM media before playback decision: %d cached probes", got)
+	}
+
+	plan, probe := server.selectPlaybackPlan(request, mapping, PlaybackStageDecisionRequest, PlexDecisionUnknown, false)
+	if plan.Plan != PlaybackPlanSTRMRedirect || probe == nil || probe.AudioCodec != "aac" {
+		t.Fatalf("playback decision did not probe STRM media: plan=%+v probe=%+v", plan, probe)
+	}
+	if got := cachedProbeCount(server); got != 1 {
+		t.Fatalf("expected one cached playback probe, got %d", got)
+	}
+}
+
+func TestRememberDirectDecisionRejectsIncompatibleProbe(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer media.Close()
+
+	tools := t.TempDir()
+	ffprobeScript := `#!/bin/sh
+cat <<'EOF'
+{"streams":[{"codec_type":"video","codec_name":"h264"},{"codec_type":"audio","codec_name":"pcm_s16le"}],"format":{"duration":"1"}}
+EOF
+`
+	if err := os.WriteFile(filepath.Join(tools, "ffprobe"), []byte(ffprobeScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	upstream, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.PlexUpstream = upstream
+	cfg.STRMRoots = []string{t.TempDir()}
+	cfg.AllowPrivate = true
+	cfg.AllowedPorts = nil
+	cfg.FFmpegPath = filepath.Join(tools, "ffmpeg")
+	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mapping := PartMapping{
+		PartID:      "321",
+		Kind:        PartKindSTRM,
+		STRMPath:    "/media/movie.strm",
+		ResolvedURL: media.URL + "/movie.mkv",
+	}
+	server.mappings.Put(mapping)
+	request := httptest.NewRequest(http.MethodGet, "http://proxy.test/video/:/transcode/universal/decision?session=audio-fallback&directPlay=0&directStream=0", nil)
+	body := []byte(`<MediaContainer><Video><Media><Part id="321" file="/media/movie.strm" decision="directplay" /></Media></Video></MediaContainer>`)
+
+	server.rememberDirectDecision(request, "application/xml", body)
+	if _, ok := server.directDecisionRecord("audio-fallback"); ok {
+		t.Fatal("incompatible directplay response was recorded as a direct decision")
+	}
+	if got := cachedProbeCount(server); got != 1 {
+		t.Fatalf("expected the decision response to reuse one playback probe, got %d", got)
+	}
+}
+
+func TestDirectDecisionCachesCompatibleRetry(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "video/x-matroska")
+		writer.Header().Set("Content-Length", "5")
+		writer.WriteHeader(http.StatusOK)
+		if request.Method != http.MethodHead {
+			_, _ = io.WriteString(writer, "media")
+		}
+	}))
+	defer media.Close()
+
+	tools := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tools, "ffmpeg"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ffprobe := `#!/bin/sh
+sleep 1
+cat <<'EOF'
+{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"1"}}
+EOF
+`
+	if err := os.WriteFile(filepath.Join(tools, "ffprobe"), []byte(ffprobe), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	strmPath := filepath.Join(root, "movie.strm")
+	if err := os.WriteFile(strmPath, []byte(media.URL+"/movie.mkv\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plex := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/library/metadata/42":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"MediaContainer":{"Metadata":[{"Media":[{"Part":[{"id":"321","key":"/library/parts/321/file","file":%q}]}]}]}}`, strmPath)
+		case "/video/:/transcode/universal/decision":
+			writer.Header().Set("Content-Type", "application/xml")
+			_, _ = fmt.Fprintf(writer, `<MediaContainer><Video><Media><Part id="321" file=%q decision="directplay" /></Media></Video></MediaContainer>`, strmPath)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer plex.Close()
+
+	upstream, err := url.Parse(plex.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.PlexUpstream = upstream
+	cfg.STRMRoots = []string{root}
+	cfg.AllowPrivate = true
+	cfg.AllowedPorts = nil
+	cfg.FFmpegPath = filepath.Join(tools, "ffmpeg")
+	app, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.mappings.Put(PartMapping{
+		PartID:      "321",
+		Kind:        PartKindSTRM,
+		STRMPath:    "/media/movie.strm",
+		ResolvedURL: media.URL + "/movie.mkv",
+	})
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	decisionPath := url.QueryEscape("/library/metadata/42")
+	decisionURL := server.URL + "/video/:/transcode/universal/decision?path=" + decisionPath + "&session=compatible-retry&directPlay=1&directStream=0"
+	started := time.Now()
+	response, err := server.Client().Get(decisionURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if elapsed := time.Since(started); elapsed >= 900*time.Millisecond {
+		t.Fatalf("first direct decision waited for the probe: %s", elapsed)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `decision="directplay"`) {
+		t.Fatalf("unexpected first direct decision: status=%d headers=%v body=%s", response.StatusCode, response.Header, body)
+	}
+	if decision, ok := app.directDecisionRecord("compatible-retry"); !ok {
+		t.Fatalf("first direct decision was not cached: probes=%d mappings=%+v", cachedProbeCount(app), app.mappings)
+	} else if decision.mapping.PartID != "321" || len(decision.body) == 0 {
+		t.Fatalf("cached direct decision is incomplete: %+v", decision)
+	}
+
+	secondURL := server.URL + "/video/:/transcode/universal/decision?path=" + decisionPath + "&session=compatible-retry&directPlay=0&directStream=0"
+	response, err = server.Client().Get(secondURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("X-Plex-Strm-Proxy") != "direct-cache" {
+		body, _ = io.ReadAll(response.Body)
+		t.Fatalf("compatible retry did not stay direct: status=%d headers=%v body=%s", response.StatusCode, response.Header, body)
+	}
+}
+
+func cachedProbeCount(server *Server) int {
+	server.probeMu.Lock()
+	defer server.probeMu.Unlock()
+	return len(server.probes)
+}
+
+func TestDetailedMetadataResponseDoesNotProbeSTRMMedia(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(writer, "media")
+	}))
+	defer media.Close()
+
+	tools := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tools, "ffprobe"), []byte("#!/bin/sh\necho '{\"streams\":[],\"format\":{}}'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	strmPath := filepath.Join(root, "movie.strm")
+	if err := os.WriteFile(strmPath, []byte(media.URL+"/movie.mp4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plex := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/library/metadata/42" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/xml")
+		_, _ = fmt.Fprintf(writer, `<MediaContainer><Video><Media><Part id="321" file=%q /></Media></Video></MediaContainer>`, strmPath)
+	}))
+	defer plex.Close()
+
+	server := newTestServerWithRoot(t, plex.URL, root, "redirect")
+	defer server.Close()
+	server.app.cfg.FFmpegPath = filepath.Join(tools, "ffmpeg")
+
+	response, err := server.Client().Get(server.URL + "/library/metadata/42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `container="mp4"`) {
+		t.Fatalf("unexpected metadata response: status=%d body=%s", response.StatusCode, body)
+	}
+	if got := cachedProbeCount(server.app); got != 0 {
+		t.Fatalf("detailed metadata unexpectedly probed STRM media: %d cached probes", got)
+	}
 }
 
 func TestTransparentProxyPreservesPlexTokenAndPath(t *testing.T) {
@@ -561,6 +831,19 @@ func TestRenderHLSTranscodeDecisionJSON(t *testing.T) {
 	for _, expected := range []string{`"protocol":"hls"`, `"container":"mpegts"`, `"codec":"h264"`, `"codec":"aac"`, `"decision":"transcode"`, `/video/:/transcode/universal/session/mobile-test/base/index.m3u8`} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("rewritten JSON HLS decision is missing %q: %s", expected, text)
+		}
+	}
+}
+
+func TestDASHResourcesAreNotClaimedByProxyHLS(t *testing.T) {
+	for _, relative := range []string{"base/index.m3u8", "base/00000.ts", "seek-00012.m3u8"} {
+		if !isProxyOwnedHLSResource(relative) {
+			t.Fatalf("proxy HLS resource %q was not recognized", relative)
+		}
+	}
+	for _, relative := range []string{"0/header", "1/header", "0/init-stream0.m4s", "1/chunk-stream1-00001.m4s"} {
+		if isProxyOwnedHLSResource(relative) {
+			t.Fatalf("DASH resource %q was incorrectly claimed by proxy HLS", relative)
 		}
 	}
 }
@@ -994,4 +1277,235 @@ func newTestServerWithRoot(t *testing.T, plexURL, root, playbackMode string) *te
 		t.Fatal(err)
 	}
 	return &testHTTPServer{Server: httptest.NewServer(app.Handler()), app: app}
+}
+
+func TestCachedDirectDecisionReplayRequiresSameSession(t *testing.T) {
+	media := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "video/x-matroska")
+		writer.Header().Set("Content-Length", "5")
+		writer.WriteHeader(http.StatusOK)
+		if request.Method != http.MethodHead {
+			_, _ = io.WriteString(writer, "media")
+		}
+	}))
+	defer media.Close()
+
+	tools := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tools, "ffmpeg"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ffprobe := `#!/bin/sh
+cat <<'EOF2'
+{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"1"}}
+EOF2
+`
+	if err := os.WriteFile(filepath.Join(tools, "ffprobe"), []byte(ffprobe), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	strmPath := filepath.Join(root, "movie.strm")
+	if err := os.WriteFile(strmPath, []byte(media.URL+"/movie.mkv\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var decisionHits int
+	var hitsMu sync.Mutex
+	plex := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/library/metadata/42":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"MediaContainer":{"Metadata":[{"Media":[{"Part":[{"id":"321","key":"/library/parts/321/file","file":%q}]}]}]}}`, strmPath)
+		case "/video/:/transcode/universal/decision":
+			hitsMu.Lock()
+			decisionHits++
+			hitsMu.Unlock()
+			writer.Header().Set("Content-Type", "application/xml")
+			_, _ = fmt.Fprintf(writer, `<MediaContainer><Video><Media><Part id="321" file=%q decision="directplay" /></Media></Video></MediaContainer>`, strmPath)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer plex.Close()
+
+	upstream, err := url.Parse(plex.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.PlexUpstream = upstream
+	cfg.STRMRoots = []string{root}
+	cfg.AllowPrivate = true
+	cfg.AllowedPorts = nil
+	cfg.FFmpegPath = filepath.Join(tools, "ffmpeg")
+	app, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.mappings.Put(PartMapping{
+		PartID:      "321",
+		Kind:        PartKindSTRM,
+		STRMPath:    "/media/movie.strm",
+		ResolvedURL: media.URL + "/movie.mkv",
+	})
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	decisionPath := url.QueryEscape("/library/metadata/42")
+	firstURL := server.URL + "/video/:/transcode/universal/decision?path=" + decisionPath + "&session=session-a&directPlay=1&directStream=0"
+	response, err := server.Client().Get(firstURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `decision="directplay"`) {
+		t.Fatalf("unexpected first decision: status=%d body=%s", response.StatusCode, body)
+	}
+	if decision, ok := app.directDecisionRecord("session-a"); !ok || len(decision.body) == 0 {
+		t.Fatal("first direct decision was not remembered for session-a")
+	}
+
+	// A different session asking for transcode must not receive session-a's
+	// cached direct decision; its request has to reach Plex itself.
+	otherURL := server.URL + "/video/:/transcode/universal/decision?path=" + decisionPath + "&session=session-b&directPlay=0&directStream=0"
+	response, err = server.Client().Get(otherURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.Header.Get("X-Plex-Strm-Proxy") == "direct-cache" {
+		t.Fatal("cached direct decision was replayed for a different session")
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `decision="directplay"`) {
+		t.Fatalf("unexpected other-session decision: status=%d body=%s", response.StatusCode, body)
+	}
+	hitsMu.Lock()
+	hits := decisionHits
+	hitsMu.Unlock()
+	if hits != 2 {
+		t.Fatalf("expected both decisions to reach Plex, upstream hits=%d", hits)
+	}
+
+	// The same session retrying with an explicit transcode intent stays direct.
+	retryURL := server.URL + "/video/:/transcode/universal/decision?path=" + decisionPath + "&session=session-a&directPlay=0&directStream=0"
+	response, err = server.Client().Get(retryURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("X-Plex-Strm-Proxy") != "direct-cache" {
+		t.Fatalf("same-session retry did not use the cached direct decision: status=%d headers=%v", response.StatusCode, response.Header)
+	}
+	hitsMu.Lock()
+	hits = decisionHits
+	hitsMu.Unlock()
+	if hits != 2 {
+		t.Fatalf("same-session replay should not hit Plex again, upstream hits=%d", hits)
+	}
+}
+
+func TestLocalPartProxyURLFollowsListenAddr(t *testing.T) {
+	tests := []struct {
+		listenAddr string
+		want       string
+	}{
+		{listenAddr: "0.0.0.0:3001", want: "http://127.0.0.1:3001/library/parts/321/file?plexTranscode=1"},
+		{listenAddr: ":3001", want: "http://127.0.0.1:3001/library/parts/321/file?plexTranscode=1"},
+		{listenAddr: "127.0.0.1:3999", want: "http://127.0.0.1:3999/library/parts/321/file?plexTranscode=1"},
+		{listenAddr: "192.168.1.5:3001", want: "http://192.168.1.5:3001/library/parts/321/file?plexTranscode=1"},
+		{listenAddr: "bad", want: "http://127.0.0.1:3001/library/parts/321/file?plexTranscode=1"},
+	}
+	for _, test := range tests {
+		server := &Server{cfg: Config{ListenAddr: test.listenAddr}}
+		if got := server.localPartProxyURL("321"); got != test.want {
+			t.Fatalf("localPartProxyURL(%q) = %q, want %q", test.listenAddr, got, test.want)
+		}
+	}
+}
+
+func newCacheTestServer(t *testing.T) *Server {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.STRMRoots = []string{t.TempDir()}
+	cfg.AllowPrivate = true
+	cfg.AllowedPorts = nil
+	server, err := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
+func TestPruneDirectDecisionsBoundsRecords(t *testing.T) {
+	server := newCacheTestServer(t)
+	now := time.Now()
+
+	server.decisionMu.Lock()
+	for i := 0; i < 5; i++ {
+		server.directDecisions[fmt.Sprintf("expired-%d", i)] = directDecision{createdAt: now.Add(-time.Hour), expiresAt: now.Add(-time.Minute)}
+	}
+	for i := 0; i < directDecisionSessionLimit+10; i++ {
+		createdAt := now.Add(time.Duration(i) * time.Second)
+		server.directDecisions[fmt.Sprintf("live-%d", i)] = directDecision{createdAt: createdAt, expiresAt: now.Add(time.Hour)}
+		server.directByPart[fmt.Sprintf("%d", i)] = directDecision{createdAt: createdAt, expiresAt: now.Add(time.Hour)}
+	}
+	server.pruneDirectDecisionsLocked(now)
+	sessions, parts := len(server.directDecisions), len(server.directByPart)
+	server.decisionMu.Unlock()
+
+	if sessions > directDecisionSessionLimit {
+		t.Fatalf("session cache not bounded: %d entries", sessions)
+	}
+	if parts > directDecisionSessionLimit {
+		t.Fatalf("part cache not bounded: %d entries", parts)
+	}
+	for i := 0; i < 5; i++ {
+		if _, ok := server.directDecisions[fmt.Sprintf("expired-%d", i)]; ok {
+			t.Fatalf("expired decision expired-%d survived pruning", i)
+		}
+	}
+	if _, ok := server.directDecisions["live-0"]; ok {
+		t.Fatal("oldest live decision was not evicted first")
+	}
+	if _, ok := server.directDecisions[fmt.Sprintf("live-%d", directDecisionSessionLimit+9)]; !ok {
+		t.Fatal("newest live decision should survive pruning")
+	}
+}
+
+func TestRememberMetadataPartLookupsResetsWhenFull(t *testing.T) {
+	server := newCacheTestServer(t)
+	server.mappings.Put(PartMapping{
+		PartID:      "321",
+		Kind:        PartKindSTRM,
+		STRMPath:    "/media/movie.strm",
+		ResolvedURL: "https://media.example/movie.mkv",
+	})
+
+	now := time.Now()
+	server.metadataMu.Lock()
+	for i := 0; i < metadataPartLookupMaxEntries+5; i++ {
+		server.metadataLookups[fmt.Sprintf("/library/metadata/%d\x00%d\x00%d", i, 0, 0)] = metadataPartLookupCacheEntry{
+			lookup:    metadataPartLookup{},
+			expiresAt: now.Add(30 * time.Second),
+		}
+	}
+	server.metadataMu.Unlock()
+
+	body := []byte(`<MediaContainer><Video><Media><Part id="321" file="/media/movie.strm" /></Media></Video></MediaContainer>`)
+	server.rememberMetadataPartLookups("/library/metadata/42", "application/xml", body)
+
+	server.metadataMu.Lock()
+	size := len(server.metadataLookups)
+	_, hasNew := server.metadataLookups[metadataPartLookupKey("/library/metadata/42", 0, 0)]
+	server.metadataMu.Unlock()
+	if size > metadataPartLookupMaxEntries {
+		t.Fatalf("metadata lookup cache not bounded: %d entries", size)
+	}
+	if !hasNew {
+		t.Fatal("fresh lookup was not cached after reset")
+	}
 }
