@@ -1,7 +1,10 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -18,6 +21,7 @@ type mediaProbe struct {
 	Width               int
 	Height              int
 	VideoCodec          string
+	VideoCodecString    string
 	AudioCodec          string
 	AudioChannels       int
 	VideoBitrateKbps    int
@@ -72,6 +76,12 @@ type mediaProbeCacheEntry struct {
 	expiresAt time.Time
 }
 
+// A selected STRM detail request may need to resolve a signed redirect chain
+// and let ffprobe read the Matroska/MP4 header over a slow remote WebDAV path.
+// This budget applies only to the selected detail/play-queue item; list and
+// home requests do not cold-probe media.
+const strmMetadataProbeTimeout = 45 * time.Second
+
 type ffprobeResult struct {
 	Streams []struct {
 		Index              int         `json:"index"`
@@ -96,6 +106,7 @@ type ffprobeResult struct {
 		ColorTransfer      string      `json:"color_transfer"`
 		ColorPrimaries     string      `json:"color_primaries"`
 		Level              int         `json:"level"`
+		Extradata          string      `json:"extradata"`
 		Refs               int         `json:"refs"`
 		Disposition        struct {
 			Default     int `json:"default"`
@@ -147,9 +158,11 @@ func (value *flexibleInt) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// probeMedia runs ffprobe against sourceURL. The caller must have validated
-// the URL and its redirect chain via ResolveMediaTarget first; ffprobe then
-// runs against the already-validated final URL without re-resolving.
+// probeMedia runs ffprobe against sourceURL. Callers that pass a remote URL
+// must validate it with ResolveMediaTarget first. STRM mappings normally use
+// the proxy-local Part adapter instead; that adapter performs a fresh,
+// policy-bound request for each read and avoids reusing one-shot signed
+// redirect URLs.
 func probeMedia(ctx context.Context, ffmpegPath, sourceURL string) (mediaProbe, error) {
 	if strings.TrimSpace(ffmpegPath) == "" || strings.TrimSpace(sourceURL) == "" {
 		return mediaProbe{}, fmt.Errorf("ffmpeg path and source URL are required")
@@ -164,18 +177,29 @@ func probeMedia(ctx context.Context, ffmpegPath, sourceURL string) (mediaProbe, 
 		"-rw_timeout", "30000000",
 		"-show_streams",
 		"-show_format",
+		"-show_data",
 		"-of", "json",
 		sourceURL,
 	)
-	output, err := command.Output()
+	var output bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &stderr
+	err := command.Run()
 	if err != nil {
 		if probeContext.Err() != nil {
 			return mediaProbe{}, probeContext.Err()
 		}
+		if message := strings.TrimSpace(stderr.String()); message != "" {
+			if len(message) > 2048 {
+				message = message[:2048] + "..."
+			}
+			return mediaProbe{}, fmt.Errorf("%w: %s", err, message)
+		}
 		return mediaProbe{}, err
 	}
 	var result ffprobeResult
-	if err := json.Unmarshal(output, &result); err != nil {
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
 		return mediaProbe{}, fmt.Errorf("decode ffprobe output: %w", err)
 	}
 	probe := mediaProbe{PreferredAudioIndex: -1}
@@ -221,6 +245,10 @@ func probeMedia(ctx context.Context, ffmpegPath, sourceURL string) (mediaProbe, 
 			ColorTransfer:  strings.TrimSpace(stream.ColorTransfer),
 			ColorPrimaries: strings.TrimSpace(stream.ColorPrimaries),
 		}
+		codecString := ""
+		if streamType == 1 && strings.EqualFold(parsedStream.Codec, "hevc") {
+			codecString = hevcCodecString(stream.Extradata)
+		}
 		if parsedStream.BitDepth == 0 {
 			parsedStream.BitDepth = int(stream.BitsPerCodedSample)
 		}
@@ -243,6 +271,9 @@ func probeMedia(ctx context.Context, ffmpegPath, sourceURL string) (mediaProbe, 
 			}
 			if probe.VideoProfile == "" {
 				probe.VideoProfile = parsedStream.Profile
+			}
+			if probe.VideoCodecString == "" {
+				probe.VideoCodecString = codecString
 			}
 			if probe.VideoCodedWidth == 0 {
 				probe.VideoCodedWidth = stream.CodedWidth
@@ -475,6 +506,63 @@ func normalizeContainer(formatName string) string {
 	}
 }
 
+// hevcCodecString converts the hvcC extradata emitted by ffprobe's
+// -show_data mode into the profile/level form accepted by DASH MSE clients.
+// FFmpeg's DASH muxer currently emits a bare "hev1" for HEVC copied from
+// Matroska. Some Chromium builds reject that bare value even though they can
+// decode the same bitstream when its profile and level are declared.
+func hevcCodecString(extradata string) string {
+	data, ok := decodeFFprobeHexDump(extradata)
+	if !ok || len(data) < 13 || data[0] != 1 {
+		return ""
+	}
+
+	profileByte := data[1]
+	profileSpace := ""
+	switch profileByte >> 6 {
+	case 1:
+		profileSpace = "A"
+	case 2:
+		profileSpace = "B"
+	case 3:
+		profileSpace = "C"
+	}
+	profileID := profileByte & 0x1f
+	compatibility := binary.BigEndian.Uint32(data[2:6]) >> 28
+	compatibilityText := strconv.FormatUint(uint64(compatibility), 16)
+	if compatibilityText == "" {
+		compatibilityText = "0"
+	}
+	tier := "L"
+	if profileByte&0x20 != 0 {
+		tier = "H"
+	}
+
+	return fmt.Sprintf("hev1.%s%d.%s.%s%d", profileSpace, profileID, compatibilityText, tier, data[12])
+}
+
+func decodeFFprobeHexDump(value string) ([]byte, bool) {
+	var encoded strings.Builder
+	for _, line := range strings.Split(value, "\n") {
+		colon := strings.IndexByte(line, ':')
+		if colon < 0 {
+			continue
+		}
+		hexPart := strings.TrimSpace(strings.SplitN(line[colon+1:], "  ", 2)[0])
+		for _, group := range strings.Fields(hexPart) {
+			if len(group) != 4 {
+				return nil, false
+			}
+			encoded.WriteString(group)
+		}
+	}
+	if encoded.Len() == 0 || encoded.Len()%2 != 0 {
+		return nil, false
+	}
+	data, err := hex.DecodeString(encoded.String())
+	return data, err == nil
+}
+
 func normalizeStreamProfile(codecType, profile string, rawDepth, codedDepth int) string {
 	profile = strings.TrimSpace(profile)
 	if strings.EqualFold(codecType, "video") {
@@ -559,11 +647,22 @@ func scanType(fieldOrder string) string {
 }
 
 // probeSTRMMediaForMapping probes the STRM source behind a known PartMapping.
-// The URL is validated end to end: runSTRMMediaProbe routes it through
-// ResolveMediaTarget (redirect chain plus TargetPolicy) before ffprobe runs,
-// so a redirect cannot point the subprocess at a disallowed host.
+// The raw source URL is still validated end to end through ResolveMediaTarget,
+// but ffprobe reads through the local Part adapter when the server has a
+// concrete listener. This is important for signed sources whose final
+// redirect URL is valid only for the validation request that produced it.
 func (s *Server) probeSTRMMediaForMapping(ctx context.Context, mapping PartMapping) (mediaProbe, bool) {
-	return s.probeSTRMMediaURL(ctx, mapping.ResolvedURL)
+	probeURL := ""
+	if mapping.PartID != "" && s.localPartProxyAvailable() {
+		probeURL = s.localPartProxyURL(mapping.PartID)
+	}
+	return s.probeSTRMMedia(ctx, mapping.ResolvedURL, probeURL)
+}
+
+func (s *Server) probeSTRMMediaForMetadata(ctx context.Context, mapping PartMapping) (mediaProbe, bool) {
+	probeContext, cancel := context.WithTimeout(ctx, strmMetadataProbeTimeout)
+	defer cancel()
+	return s.probeSTRMMediaForMapping(probeContext, mapping)
 }
 
 func (s *Server) cachedSTRMMediaProbeForMapping(mapping PartMapping) (mediaProbe, bool) {
@@ -585,6 +684,10 @@ func (s *Server) cachedSTRMMediaProbeForMapping(mapping PartMapping) (mediaProbe
 }
 
 func (s *Server) probeSTRMMediaURL(ctx context.Context, sourceURL string) (mediaProbe, bool) {
+	return s.probeSTRMMedia(ctx, sourceURL, "")
+}
+
+func (s *Server) probeSTRMMedia(ctx context.Context, sourceURL, probeURL string) (mediaProbe, bool) {
 	sourceURL = strings.TrimSpace(sourceURL)
 	if sourceURL == "" {
 		return mediaProbe{}, false
@@ -608,7 +711,7 @@ func (s *Server) probeSTRMMediaURL(ctx context.Context, sourceURL string) (media
 	s.probeFlights[sourceURL] = flight
 	s.probeMu.Unlock()
 
-	probe, ok := s.runSTRMMediaProbe(ctx, sourceURL)
+	probe, ok := s.runSTRMMediaProbe(ctx, sourceURL, probeURL)
 	s.probeMu.Lock()
 	if ok {
 		s.probes[sourceURL] = mediaProbeCacheEntry{value: probe, expiresAt: time.Now().Add(s.cfg.MappingCacheTTL)}
@@ -626,15 +729,20 @@ func (s *Server) probeSTRMMediaURL(ctx context.Context, sourceURL string) (media
 }
 
 // runSTRMMediaProbe resolves and validates the STRM URL's redirect chain
-// through ResolveMediaTarget before ffprobe sees it, keeping the subprocess
-// on the TargetPolicy-approved final URL.
-func (s *Server) runSTRMMediaProbe(ctx context.Context, sourceURL string) (mediaProbe, bool) {
+// through ResolveMediaTarget before ffprobe starts. For a known PartMapping,
+// ffprobe then reads through the local Part adapter rather than replaying the
+// final URL returned by validation.
+func (s *Server) runSTRMMediaProbe(ctx context.Context, sourceURL, probeURL string) (mediaProbe, bool) {
 	validatedURL, err := ResolveMediaTarget(ctx, s.mediaClient, s.policy, sourceURL)
 	if err != nil {
 		s.logger.Warn("failed to validate STRM media target", "target_host", resolvedTargetHost(sourceURL), "error", err)
 		return mediaProbe{}, false
 	}
-	probe, err := probeMedia(ctx, s.cfg.FFmpegPath, validatedURL)
+	probeTarget := validatedURL
+	if strings.TrimSpace(probeURL) != "" {
+		probeTarget = strings.TrimSpace(probeURL)
+	}
+	probe, err := probeMedia(ctx, s.cfg.FFmpegPath, probeTarget)
 	if err != nil {
 		s.logger.Warn("failed to probe STRM media", "target_host", resolvedTargetHost(sourceURL), "error", err)
 		return mediaProbe{}, false

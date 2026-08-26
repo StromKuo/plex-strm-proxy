@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer directPlayDecisionCode="3000" generalDecisionCode="1001" transcodeDecisionCode="1001" x-fixture="local-h264-eac3">
+  <Video ratingKey="local-fixture">
+    <Media id="local-media" protocol="dash" container="mp4" videoCodec="h264" audioCodec="aac" videoDecision="directplay" audioDecision="transcode" selected="1" x-unknown-media="preserve">
+      <Part id="local-part" key="/library/parts/local-part/file" protocol="dash" container="mp4" decision="transcode" selected="1" x-unknown-part="preserve">
+        <Stream id="local-video" streamType="1" codec="h264" decision="copy" selected="1" />
+        <Stream id="local-audio" streamType="2" codec="aac" decision="transcode" selected="1" />
+      </Part>
+    </Media>
+  </Video>
+</MediaContainer>

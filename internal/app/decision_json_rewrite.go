@@ -9,19 +9,26 @@ import (
 )
 
 func renderHLSTranscodeDecisionJSON(body []byte, mapping PartMapping, query url.Values, sessionID string) ([]byte, bool, error) {
+	return renderProxyTranscodeDecisionJSON(body, mapping, query, sessionID, proxyTranscodeHLS)
+}
+
+func renderProxyTranscodeDecisionJSON(body []byte, mapping PartMapping, query url.Values, sessionID string, format proxyTranscodeFormat) ([]byte, bool, error) {
+	return renderProxyTranscodeDecisionJSONWithPlan(body, mapping, query, sessionID, format, defaultProxyStreamPlan())
+}
+
+func renderProxyTranscodeDecisionJSONWithPlan(body []byte, mapping PartMapping, query url.Values, sessionID string, format proxyTranscodeFormat, plan proxyStreamPlan) ([]byte, bool, error) {
 	width, height := parseVideoResolution(query.Get("videoResolution"))
 	if width <= 0 || height <= 0 {
 		width, height = 1280, 720
 	}
 	bitrate := parseBitrateKbps(query.Get("maxVideoBitrate"))
-
 	var value any
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
 		return nil, false, err
 	}
-	changed := rewriteHLSTranscodeJSONNode(value, mapping, width, height, bitrate, sessionID)
+	changed := rewriteProxyTranscodeJSONNode(value, mapping, width, height, bitrate, sessionID, format, plan)
 	if !changed {
 		return body, false, nil
 	}
@@ -32,12 +39,12 @@ func renderHLSTranscodeDecisionJSON(body []byte, mapping PartMapping, query url.
 	return rewritten, true, nil
 }
 
-func rewriteHLSTranscodeJSONNode(node any, mapping PartMapping, width, height, bitrate int, sessionID string) bool {
+func rewriteProxyTranscodeJSONNode(node any, mapping PartMapping, width, height, bitrate int, sessionID string, format proxyTranscodeFormat, plan proxyStreamPlan) bool {
 	switch typed := node.(type) {
 	case []any:
 		changed := false
 		for _, child := range typed {
-			changed = rewriteHLSTranscodeJSONNode(child, mapping, width, height, bitrate, sessionID) || changed
+			changed = rewriteProxyTranscodeJSONNode(child, mapping, width, height, bitrate, sessionID, format, plan) || changed
 		}
 		return changed
 	case map[string]any:
@@ -54,10 +61,10 @@ func rewriteHLSTranscodeJSONNode(node any, mapping PartMapping, width, height, b
 		}
 		for key, child := range typed {
 			if strings.EqualFold(key, "Media") {
-				changed = rewriteHLSTranscodeJSONMedia(child, mapping, width, height, bitrate, sessionID) || changed
+				changed = rewriteProxyTranscodeJSONMedia(child, mapping, width, height, bitrate, sessionID, format, plan) || changed
 				continue
 			}
-			changed = rewriteHLSTranscodeJSONNode(child, mapping, width, height, bitrate, sessionID) || changed
+			changed = rewriteProxyTranscodeJSONNode(child, mapping, width, height, bitrate, sessionID, format, plan) || changed
 		}
 		return changed
 	default:
@@ -65,7 +72,8 @@ func rewriteHLSTranscodeJSONNode(node any, mapping PartMapping, width, height, b
 	}
 }
 
-func rewriteHLSTranscodeJSONMedia(value any, mapping PartMapping, width, height, bitrate int, sessionID string) bool {
+func rewriteProxyTranscodeJSONMedia(value any, mapping PartMapping, width, height, bitrate int, sessionID string, format proxyTranscodeFormat, plan proxyStreamPlan) bool {
+	container, protocol, partKey := proxyDecisionMediaAttributes(format, sessionID)
 	mediaList := []any{value}
 	if list, ok := value.([]any); ok {
 		mediaList = list
@@ -90,26 +98,35 @@ func rewriteHLSTranscodeJSONMedia(value any, mapping PartMapping, width, height,
 				continue
 			}
 			setDecisionJSONValue(media, "bitrate", bitrate)
-			setDecisionJSONValue(media, "container", "mpegts")
-			setDecisionJSONValue(media, "protocol", "hls")
-			setDecisionJSONValue(media, "videoCodec", "h264")
-			setDecisionJSONValue(media, "audioCodec", "aac")
+			setDecisionJSONValue(media, "container", container)
+			setDecisionJSONValue(media, "protocol", protocol)
+			if plan.VideoCodec != "" {
+				setDecisionJSONValue(media, "videoCodec", plan.VideoCodec)
+			}
+			if plan.AudioCodec != "" {
+				setDecisionJSONValue(media, "audioCodec", plan.AudioCodec)
+			}
 			setDecisionJSONValue(media, "width", width)
 			setDecisionJSONValue(media, "height", height)
 			setDecisionJSONValue(media, "selected", true)
 			removeJSONValue(part, "file")
-			setDecisionJSONValue(part, "key", hlsPartKey(sessionID))
+			setDecisionJSONValue(part, "key", partKey)
 			setDecisionJSONValue(part, "bitrate", bitrate)
-			setDecisionJSONValue(part, "container", "mpegts")
-			setDecisionJSONValue(part, "protocol", "hls")
+			setDecisionJSONValue(part, "container", container)
+			setDecisionJSONValue(part, "protocol", protocol)
 			setDecisionJSONValue(part, "decision", "transcode")
 			setDecisionJSONValue(part, "width", width)
 			setDecisionJSONValue(part, "height", height)
 			setDecisionJSONValue(part, "selected", true)
-			setDecisionJSONValue(part, "Stream", []any{
-				map[string]any{"streamType": 1, "codec": "h264", "width": width, "height": height, "decision": "transcode", "location": "segments-av", "selected": true},
-				map[string]any{"streamType": 2, "codec": "aac", "channels": 2, "decision": "transcode", "location": "segments-av", "selected": true},
-			})
+			videoStream := map[string]any{"streamType": 1, "width": width, "height": height, "decision": plan.VideoDecision, "location": plan.VideoLocation, "selected": true}
+			if plan.VideoCodec != "" {
+				videoStream["codec"] = plan.VideoCodec
+			}
+			audioStream := map[string]any{"streamType": 2, "channels": 2, "decision": plan.AudioDecision, "location": plan.AudioLocation, "selected": true}
+			if plan.AudioCodec != "" {
+				audioStream["codec"] = plan.AudioCodec
+			}
+			setDecisionJSONValue(part, "Stream", []any{videoStream, audioStream})
 			changed = true
 		}
 	}
@@ -152,6 +169,69 @@ func rewriteSTRMDirectDecisionJSONWithProbe(body []byte, mapping PartMapping, pr
 		return nil, false, err
 	}
 	return rewritten, true, nil
+}
+
+// rewriteSTRMNativeDirectDecisionJSON keeps Plex's native direct decision
+// intact and only replaces the proxy-local Part file URL with the resolved
+// source URL visible to the playback client.
+func rewriteSTRMNativeDirectDecisionJSON(body []byte, mapping PartMapping) ([]byte, bool, error) {
+	if mapping.Kind != PartKindSTRM || mapping.PartID == "" || mapping.ResolvedURL == "" {
+		return body, false, nil
+	}
+	var value any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return nil, false, err
+	}
+	if !rewriteSTRMNativeDirectDecisionJSONNode(value, mapping) {
+		return body, false, nil
+	}
+	rewritten, err := json.Marshal(value)
+	if err != nil {
+		return nil, false, err
+	}
+	return rewritten, true, nil
+}
+
+func rewriteSTRMNativeDirectDecisionJSONNode(node any, mapping PartMapping) bool {
+	switch typed := node.(type) {
+	case []any:
+		changed := false
+		for _, child := range typed {
+			changed = rewriteSTRMNativeDirectDecisionJSONNode(child, mapping) || changed
+		}
+		return changed
+	case map[string]any:
+		changed := false
+		for key, child := range typed {
+			if strings.EqualFold(key, "Part") {
+				changed = rewriteSTRMNativeDirectDecisionJSONParts(child, mapping) || changed
+				continue
+			}
+			changed = rewriteSTRMNativeDirectDecisionJSONNode(child, mapping) || changed
+		}
+		return changed
+	default:
+		return false
+	}
+}
+
+func rewriteSTRMNativeDirectDecisionJSONParts(value any, mapping PartMapping) bool {
+	parts := []any{value}
+	if list, ok := value.([]any); ok {
+		parts = list
+	}
+	changed := false
+	for _, item := range parts {
+		part, ok := item.(map[string]any)
+		if !ok || !decisionJSONPartMatches(part, mapping) {
+			continue
+		}
+		setDecisionJSONValue(part, "file", mapping.ResolvedURL)
+		changed = true
+	}
+	return changed
 }
 
 func rewriteSTRMDirectDecisionJSONNode(node any, mapping PartMapping, container string, probe *mediaProbe) bool {

@@ -70,10 +70,19 @@ func (s *MappingStore) Put(mapping PartMapping) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if mapping.UpdatedAt.IsZero() {
-		mapping.UpdatedAt = s.now()
+	now := s.now()
+	if existing, ok := s.items[mapping.PartID]; ok && now.Before(existing.expiresAt) && existing.value.Kind == PartKindSTRM && existing.value.ResolvedURL != "" && mapping.Kind == PartKindLocal {
+		// Plex may later echo the same Part through a session/status response
+		// without the original .strm file. That representation is not a new
+		// library fact and must not downgrade the authoritative STRM mapping;
+		// otherwise the next Part request is sent back to Plex and can produce
+		// an upstream redirect/auth response instead of the configured 302.
+		mapping = existing.value
 	}
-	s.items[mapping.PartID] = mappingEntry{value: mapping, expiresAt: s.now().Add(s.ttl)}
+	if mapping.UpdatedAt.IsZero() {
+		mapping.UpdatedAt = now
+	}
+	s.items[mapping.PartID] = mappingEntry{value: mapping, expiresAt: now.Add(s.ttl)}
 }
 
 func (s *MappingStore) Len() int {
@@ -83,10 +92,11 @@ func (s *MappingStore) Len() int {
 }
 
 type partRecord struct {
-	ID   string
-	File string
-	Key  string
-	Path string
+	ID       string
+	File     string
+	Key      string
+	Path     string
+	Selected bool
 }
 
 func (s *MappingStore) IngestStructuredResponse(contentType string, body []byte, defaultSTRMPath string, resolver *Resolver) []PartMapping {
@@ -182,20 +192,7 @@ func extractXMLPartRecords(body []byte) []partRecord {
 		if !ok || start.Name.Local != "Part" {
 			continue
 		}
-		var record partRecord
-		for _, attr := range start.Attr {
-			switch strings.ToLower(attr.Name.Local) {
-			case "id":
-				record.ID = attr.Value
-			case "file":
-				record.File = attr.Value
-			case "key":
-				record.Key = attr.Value
-			case "path":
-				record.Path = attr.Value
-			}
-		}
-		records = append(records, record)
+		records = append(records, partRecordFromXMLAttrs(start.Attr))
 	}
 	return records
 }
@@ -217,19 +214,7 @@ func extractJSONPartRecords(body []byte) []partRecord {
 			}
 		case map[string]any:
 			if inPart {
-				record := partRecord{}
-				for key, child := range typed {
-					switch strings.ToLower(key) {
-					case "id":
-						record.ID = jsonString(child)
-					case "file":
-						record.File = jsonString(child)
-					case "key":
-						record.Key = jsonString(child)
-					case "path":
-						record.Path = jsonString(child)
-					}
-				}
+				record := partRecordFromJSONObject(typed)
 				if record.ID != "" {
 					records = append(records, record)
 				}
@@ -265,8 +250,10 @@ func jsonString(value any) string {
 }
 
 func jsonBool(value any) bool {
-	parsed, ok := value.(bool)
-	return ok && parsed
+	if parsed, ok := value.(bool); ok {
+		return parsed
+	}
+	return metadataBool(jsonString(value))
 }
 
 func isSTRMPath(value string) bool {

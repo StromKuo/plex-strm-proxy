@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer directPlayDecisionCode="1000" generalDecisionCode="1000" transcodeDecisionCode="1000" x-fixture="strm-hevc-eac3-aac-direct">
+  <Video ratingKey="strm-direct-fixture">
+    <Media id="strm-direct-media" protocol="dash" container="mp4" videoCodec="hevc" audioCodec="aac" videoDecision="directplay" audioDecision="directplay" selected="1" x-unknown-media="preserve">
+      <Part id="strm-direct-part" key="/library/parts/strm-direct-part/file" file="http://127.0.0.1:3001/library/parts/strm-direct-part/file" protocol="http" container="mkv" decision="directplay" selected="1" x-unknown-part="preserve">
+        <Stream id="strm-direct-video" streamType="1" codec="hevc" decision="copy" selected="1" />
+        <Stream id="strm-direct-audio-aac" streamType="2" codec="aac" channels="2" decision="copy" selected="1" />
+        <Stream id="strm-direct-audio-eac3" streamType="2" codec="eac3" channels="6" decision="copy" selected="0" />
+      </Part>
+    </Media>
+  </Video>
+</MediaContainer>

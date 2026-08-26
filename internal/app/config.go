@@ -13,6 +13,7 @@ import (
 type Config struct {
 	ListenAddr       string
 	PlexUpstream     *url.URL
+	PlexCallbackURL  *url.URL
 	STRMRoots        []string
 	PlaybackMode     string
 	RedirectStatus   int
@@ -75,6 +76,14 @@ func LoadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("PLEX_UPSTREAM: %w", err)
 	}
 	cfg.PlexUpstream = upstream
+
+	if callbackText := envString("PLEX_CALLBACK_URL", ""); callbackText != "" {
+		callback, err := url.Parse(callbackText)
+		if err != nil {
+			return Config{}, fmt.Errorf("PLEX_CALLBACK_URL: %w", err)
+		}
+		cfg.PlexCallbackURL = callback
+	}
 
 	if roots := envString("STRM_ROOTS", ""); roots != "" {
 		cfg.STRMRoots = splitList(roots)
@@ -169,6 +178,23 @@ func (c Config) Validate() error {
 	}
 	if c.PlexUpstream.Scheme != "http" && c.PlexUpstream.Scheme != "https" {
 		return fmt.Errorf("PLEX_UPSTREAM must use http or https")
+	}
+	if c.PlexCallbackURL != nil {
+		if c.PlexCallbackURL.Scheme != "http" && c.PlexCallbackURL.Scheme != "https" {
+			return fmt.Errorf("PLEX_CALLBACK_URL must use http or https")
+		}
+		if c.PlexCallbackURL.Host == "" {
+			return fmt.Errorf("PLEX_CALLBACK_URL must include a host")
+		}
+		if c.PlexCallbackURL.User != nil {
+			return fmt.Errorf("PLEX_CALLBACK_URL must not include user information")
+		}
+		if c.PlexCallbackURL.RawQuery != "" || c.PlexCallbackURL.Fragment != "" {
+			return fmt.Errorf("PLEX_CALLBACK_URL must not include a query or fragment")
+		}
+		if c.PlexCallbackURL.Path != "" && c.PlexCallbackURL.Path != "/" {
+			return fmt.Errorf("PLEX_CALLBACK_URL must not include a path")
+		}
 	}
 	if len(c.STRMRoots) == 0 {
 		return fmt.Errorf("at least one STRM root is required")

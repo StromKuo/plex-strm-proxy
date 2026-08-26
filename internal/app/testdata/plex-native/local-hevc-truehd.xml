@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer directPlayDecisionCode="3000" generalDecisionCode="1001" transcodeDecisionCode="1001" x-fixture="local-hevc-truehd">
+  <Video ratingKey="local-hevc-truehd-fixture">
+    <Media id="local-hevc-truehd-media" protocol="dash" container="mp4" videoCodec="h264" audioCodec="aac" videoDecision="transcode" audioDecision="transcode" selected="1" x-unknown-media="preserve">
+      <Part id="local-hevc-truehd-part" key="/library/parts/local-hevc-truehd-part/file" protocol="dash" container="mp4" decision="transcode" selected="1" x-unknown-part="preserve">
+        <Stream id="local-hevc-truehd-video" streamType="1" codec="h264" decision="transcode" selected="1" />
+        <Stream id="local-hevc-truehd-audio" streamType="2" codec="aac" channels="2" decision="transcode" selected="1" />
+        <Stream id="local-hevc-truehd-subtitle" streamType="3" codec="pgs" decision="burn" selected="1" />
+      </Part>
+    </Media>
+  </Video>
+</MediaContainer>

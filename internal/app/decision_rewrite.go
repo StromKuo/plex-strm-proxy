@@ -139,6 +139,57 @@ func rewriteSTRMDirectDecisionXMLWithProbe(body []byte, mapping PartMapping, pro
 	return rewritten.Bytes(), true, nil
 }
 
+// rewriteSTRMNativeDirectDecisionXML only changes the client-facing source
+// URL in a direct decision produced by Plex. All decision codes, stream
+// attributes, and unknown fields remain Plex's values. The native decision
+// was evaluated against the proxy-local Part; exposing the resolved URL here
+// lets the client use the normal direct/302 path without making that local
+// URL meaningful on the client device.
+func rewriteSTRMNativeDirectDecisionXML(body []byte, mapping PartMapping) ([]byte, bool, error) {
+	if mapping.Kind != PartKindSTRM || mapping.PartID == "" || mapping.ResolvedURL == "" {
+		return body, false, nil
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	tokens := make([]xml.Token, 0, 64)
+	changed := false
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if start, ok := token.(xml.StartElement); ok && start.Name.Local == "Part" {
+			start = cloneXMLStartElement(start)
+			part := partRecordFromXMLAttrs(start.Attr)
+			if part.ID == mapping.PartID || xmlAttributeValue(start.Attr, "key") == directPartKey(mapping) {
+				setXMLAttribute(&start, "file", mapping.ResolvedURL)
+				changed = true
+			}
+			tokens = append(tokens, start)
+			continue
+		}
+		tokens = append(tokens, xml.CopyToken(token))
+	}
+	if !changed {
+		return body, false, nil
+	}
+
+	var rewritten bytes.Buffer
+	encoder := xml.NewEncoder(&rewritten)
+	for _, token := range tokens {
+		if err := encoder.EncodeToken(token); err != nil {
+			return nil, false, err
+		}
+	}
+	if err := encoder.Flush(); err != nil {
+		return nil, false, err
+	}
+	return rewritten.Bytes(), true, nil
+}
+
 func directPartKey(mapping PartMapping) string {
 	if mapping.PartID == "" {
 		return mapping.Key

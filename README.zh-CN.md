@@ -8,11 +8,11 @@
 
 ## 工作方式
 
-对于 STRM 媒体，代理优先把客户端重定向到 `.strm` 中的真实 HTTP(S) 媒体 URL。这样客户端可以直接从媒体源获取媒体字节，完整文件不会经过 Plex 或 NAS。
+对于 STRM 媒体，代理首先尝试让客户端直接获取 `.strm` 中的真实 HTTP(S) 媒体地址。这是最节省资源的路径，因为媒体字节不会经过 Plex 或 NAS。
 
-当客户端无法直接播放源文件时，可以对 STRM 媒体启用可选的 HLS 兼容兜底，把媒体转换成客户端能够处理的格式。这条路径会使用 FFmpeg，只适用于 STRM 媒体；普通 Plex 媒体仍使用 Plex 自己的播放和转码流程。
+代理会向 Plex 提供选中媒体的信息，并让 Plex 按原生流程做播放决策。如果 Plex 选择 Direct Play，代理会为选中的 Part 提供经过校验的真实媒体地址；如果 Plex 选择 Direct Stream 或转码，则继续由 Plex 负责。普通 Plex 媒体保持透明转发。
 
-首页和媒体库元数据响应不会再逐个探测远程 STRM 源。详细的 FFprobe 媒体信息会延迟到播放准备阶段或启动转码时执行，并复用进程内的探测缓存。
+只有在 Plex 以 HTTP 错误拒绝原生 STRM 决策或启动请求，且启用了可选兜底时，代理才可能使用 FFmpeg。兜底会尽量优先 Copy，但可能占用代理 CPU、临时磁盘空间和网络带宽。关闭兜底时，请求会保持在 Plex 原生流程中。
 
 ## 前置条件
 
@@ -49,6 +49,8 @@ docker build -t plex-strm-proxy .
 ```
 
 挂载配置中，左侧是宿主机路径，右侧是容器内路径。代理容器内的路径必须和 Plex 使用的 `.strm` 路径以及 `STRM_ROOT` 配置一致。
+
+原生 STRM 播放要求 Plex 能访问代理提供 metadata/Part 的回调地址。默认情况下，回调地址由 `LISTEN_ADDR` 推导；只有 Plex 与代理共享网络命名空间，或确实能访问该地址时才适用。使用 bridge 网络或宿主机与容器端口不一致时，应将 `PLEX_CALLBACK_URL` 设置为 Plex 实际能访问的 HTTP(S) 地址。这个配置只用于 Plex 到代理的请求；客户端、FFprobe 和 FFmpeg 仍使用代理的正常监听地址。
 
 例如，Plex 容器使用：
 
@@ -98,6 +100,7 @@ https://plex-proxy.example.com
 | --- | --- | --- |
 | `PLEX_UPSTREAM` | `http://plex:32400` | Plex Media Server 地址 |
 | `LISTEN_ADDR` | `0.0.0.0:3001` | 代理监听地址 |
+| `PLEX_CALLBACK_URL` | 由 `LISTEN_ADDR` 推导 | 原生 STRM 播放期间 Plex 获取代理本地 metadata/Part 所使用的地址 |
 | `STRM_ROOT` / `STRM_ROOTS` | `/media` | 只读 STRM 根目录 |
 | `PLAYBACK_MODE` | `redirect` | `redirect` 重定向到媒体源；`proxy` 让媒体流量经过本服务 |
 | `STRM_HLS_TRANSCODE` | `true` | 启用 STRM HLS 兼容兜底 |
@@ -129,6 +132,7 @@ docker run ... \
 ## 限制
 
 - redirect 模式要求播放客户端自身能够访问外部媒体 URL。
+- 如果 Plex 原生 STRM 决策或 start 请求被拒绝，可以启用兼容兜底（`STRM_HLS_TRANSCODE`）处理该 STRM 会话。关闭时请求保持在 Plex 原生流程中，代理不会启动 FFmpeg 进程。
 - 如果媒体链接带有签名或过期时间参数，该链接必须在整个播放期间保持有效，并且媒体源需要支持分段读取和拖动进度（HTTP Range）。
 - HLS 兜底会占用代理 CPU、临时磁盘空间和网络带宽。
 - HLS 长距离拖动可能临时占用额外的磁盘空间和网络带宽。

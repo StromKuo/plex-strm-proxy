@@ -38,6 +38,37 @@ The playback plans have these ownership boundaries:
 
 Proxy HLS first attempts `video copy + audio AAC`; it falls back to H.264/AAC video transcoding if stream copy fails. HLS fallback consumes NAS CPU, temporary disk space, and network bandwidth, so it must not become the default path for all media.
 
+### Native STRM coordination details
+
+The public README intentionally describes outcomes and configuration rather than this
+request choreography. Keep the following details here when changing the implementation:
+
+- Home and library-list metadata responses must not cold-probe every remote STRM source.
+  A detailed metadata request may perform one bounded probe for the selected item and
+  reuse the result from the in-memory probe cache. A play queue may cold-probe only its
+  selected STRM Part. Ordinary Plex media must not enter this probe path.
+- Before FFprobe or FFmpeg opens a remote STRM URL, call `ResolveMediaTarget` through the
+  policy-bound client. It follows and validates the redirect chain, first trying a
+  bounded `HEAD` with `Range: bytes=0-0` and retrying with a bounded range `GET` when the
+  source times out, rejects `HEAD`, or sends `HEAD` to a login page. The selected detail
+  probe has a separate 45-second budget; list and home requests still do not probe.
+- Native STRM decision requests use a proxy-reachable metadata/Part callback so Plex can
+  make the native Direct Play, Direct Stream, or transcode decision. Only a native
+  Direct Play result may have the selected Part file rewritten to the validated source
+  URL and remembered for the current playback session and Part. A selected Part/Stream
+  transcode decision must remain Plex-owned and must not populate the direct cache.
+  Later requests that explicitly set both `directPlay=0` and `directStream=0` must always
+  be passed back to Plex, even if an earlier request in the same session was Direct Play.
+- A client cancellation or timeout is not evidence that Plex rejected the native STRM
+  path. Proxy FFmpeg/HLS may start only for an actual rejected STRM decision/start and
+  an enabled fallback. This fallback is STRM-only; ordinary Plex media remains on the
+  transparent Plex path. HLS clients receive HLS playlists, while DASH clients receive
+  a DASH MPD and fragmented MP4 segments.
+- `PLEX_CALLBACK_URL` is the address Plex uses to call back into the proxy for metadata
+  and Part requests. The proxy's own listener address remains the address used by the
+  in-process FFprobe/FFmpeg clients. In bridge networking or with different host and
+  container ports, validate this two-address topology with a real Plex-to-proxy request.
+
 ## Outbound security rules
 
 Every remote request originating from an STRM file must use `TargetPolicy` and `NewMediaClient`. Do not create a bare `http.Client`, and do not pass an unvalidated STRM URL directly to FFprobe or FFmpeg.

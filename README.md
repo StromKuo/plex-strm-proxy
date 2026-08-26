@@ -8,11 +8,11 @@ The proxy leaves Plex's library and database unchanged.
 
 ## How it works
 
-For an STRM item, the proxy prefers to redirect the client to the real HTTP(S) media URL. This allows the client and the media provider to exchange media bytes directly, without sending the whole file through Plex or the NAS.
+For an STRM item, the proxy first tries to let the client fetch the real HTTP(S) media URL directly. This is the lowest-resource path because the media bytes do not pass through Plex or the NAS.
 
-When a client cannot play the source directly, an optional HLS compatibility fallback can convert STRM playback into a format the client can handle. This uses FFmpeg and applies only to STRM media; ordinary Plex media continues to use Plex's own playback and transcoding pipeline.
+The proxy supplies Plex with the selected item's media information and lets Plex make its normal playback decision. If Plex chooses Direct Play, the proxy exposes the validated source URL for the selected Part; if Plex chooses Direct Stream or transcoding, Plex keeps ownership of that process. Ordinary Plex media remains transparent.
 
-Home and library metadata responses are rewritten without probing every remote STRM source. Detailed FFprobe inspection is deferred until playback preparation or a transcode starts, then reused from the in-memory probe cache.
+Only when Plex rejects the native STRM decision or start request with an HTTP error, and the optional fallback is enabled, may the proxy use FFmpeg. The fallback is copy-first where possible, but can consume proxy CPU, temporary disk space, and network bandwidth. With the fallback disabled, the request remains on Plex's native path.
 
 ## Requirements
 
@@ -49,6 +49,8 @@ docker build -t plex-strm-proxy .
 ```
 
 In the volume mapping, the path on the left is on the host and the path on the right is inside the container. The proxy-side path must match the path Plex uses for the same `.strm` files and the configured `STRM_ROOT`.
+
+Native STRM playback requires Plex to reach the proxy for its metadata/Part callback. The default callback is derived from `LISTEN_ADDR`; this is suitable when Plex shares the proxy's network namespace or can reach that address. With bridge networking or different host/container ports, set `PLEX_CALLBACK_URL` to an HTTP(S) URL that Plex can reach. This setting is only for Plex-to-proxy requests; the client, FFprobe, and FFmpeg continue to use the normal proxy listener.
 
 For example, if the Plex container uses:
 
@@ -98,6 +100,7 @@ For public use in the official app or app.plex.tv, configure a publicly reachabl
 | --- | --- | --- |
 | `PLEX_UPSTREAM` | `http://plex:32400` | Plex Media Server address |
 | `LISTEN_ADDR` | `0.0.0.0:3001` | Proxy listen address |
+| `PLEX_CALLBACK_URL` | derived from `LISTEN_ADDR` | URL Plex can use to fetch the proxy-local metadata/Part during native STRM playback |
 | `STRM_ROOT` / `STRM_ROOTS` | `/media` | Read-only STRM root(s) |
 | `PLAYBACK_MODE` | `redirect` | `redirect` sends clients to the source URL; `proxy` streams through this service |
 | `STRM_HLS_TRANSCODE` | `true` | Enable STRM HLS compatibility fallback |
@@ -129,6 +132,7 @@ In `redirect` mode the client still resolves the media URL on its own, so each c
 ## Limitations
 
 - Redirect mode requires the client to reach the external media URL itself.
+- If Plex's native STRM decision or start request is rejected, enabling the compatibility fallback (`STRM_HLS_TRANSCODE`) lets the proxy handle that STRM session. With it disabled, the request remains on Plex's native path and no proxy FFmpeg process is started.
 - If a media URL contains a signature or expiration parameter, it must remain valid for the entire playback session, and the media provider must support partial reads and seeking (HTTP Range).
 - HLS fallback uses proxy CPU, temporary disk space, and network bandwidth.
 - Long seeks in HLS fallback may temporarily use additional disk space and network bandwidth.

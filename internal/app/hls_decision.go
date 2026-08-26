@@ -10,6 +10,14 @@ import (
 )
 
 func renderHLSTranscodeDecisionXML(body []byte, contentType string, mapping PartMapping, query url.Values, sessionID string) ([]byte, bool, error) {
+	return renderProxyTranscodeDecisionXML(body, contentType, mapping, query, sessionID, proxyTranscodeHLS)
+}
+
+func renderProxyTranscodeDecisionXML(body []byte, contentType string, mapping PartMapping, query url.Values, sessionID string, format proxyTranscodeFormat) ([]byte, bool, error) {
+	return renderProxyTranscodeDecisionXMLWithPlan(body, contentType, mapping, query, sessionID, format, defaultProxyStreamPlan())
+}
+
+func renderProxyTranscodeDecisionXMLWithPlan(body []byte, contentType string, mapping PartMapping, query url.Values, sessionID string, format proxyTranscodeFormat, plan proxyStreamPlan) ([]byte, bool, error) {
 	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
 	if mediaType != "application/xml" && mediaType != "text/xml" && mediaType != "application/plex+xml" {
 		return nil, false, nil
@@ -20,6 +28,7 @@ func renderHLSTranscodeDecisionXML(body []byte, contentType string, mapping Part
 		width, height = 1280, 720
 	}
 	bitrate := parseBitrateKbps(query.Get("maxVideoBitrate"))
+	container, protocol, partKey := proxyDecisionMediaAttributes(format, sessionID)
 
 	decoder := xml.NewDecoder(bytes.NewReader(body))
 	tokens := make([]xml.Token, 0, 64)
@@ -47,10 +56,14 @@ func renderHLSTranscodeDecisionXML(body []byte, contentType string, mapping Part
 				setXMLAttribute(&start, "transcodeDecisionText", "Direct play not available; Conversion OK.")
 			case "Media":
 				setXMLAttribute(&start, "bitrate", strconv.Itoa(bitrate))
-				setXMLAttribute(&start, "container", "mpegts")
-				setXMLAttribute(&start, "protocol", "hls")
-				setXMLAttribute(&start, "videoCodec", "h264")
-				setXMLAttribute(&start, "audioCodec", "aac")
+				setXMLAttribute(&start, "container", container)
+				setXMLAttribute(&start, "protocol", protocol)
+				if plan.VideoCodec != "" {
+					setXMLAttribute(&start, "videoCodec", plan.VideoCodec)
+				}
+				if plan.AudioCodec != "" {
+					setXMLAttribute(&start, "audioCodec", plan.AudioCodec)
+				}
 				setXMLAttribute(&start, "width", strconv.Itoa(width))
 				setXMLAttribute(&start, "height", strconv.Itoa(height))
 				setXMLAttribute(&start, "selected", "1")
@@ -60,10 +73,10 @@ func renderHLSTranscodeDecisionXML(body []byte, contentType string, mapping Part
 				if targetPart {
 					removeXMLAttribute(&start, "file")
 					removeXMLAttribute(&start, "key")
-					setXMLAttribute(&start, "key", hlsPartKey(sessionID))
+					setXMLAttribute(&start, "key", partKey)
 					setXMLAttribute(&start, "bitrate", strconv.Itoa(bitrate))
-					setXMLAttribute(&start, "container", "mpegts")
-					setXMLAttribute(&start, "protocol", "hls")
+					setXMLAttribute(&start, "container", container)
+					setXMLAttribute(&start, "protocol", protocol)
 					setXMLAttribute(&start, "decision", "transcode")
 					setXMLAttribute(&start, "width", strconv.Itoa(width))
 					setXMLAttribute(&start, "height", strconv.Itoa(height))
@@ -72,7 +85,7 @@ func renderHLSTranscodeDecisionXML(body []byte, contentType string, mapping Part
 			}
 			tokens = append(tokens, start)
 			if start.Name.Local == "Part" && targetPart {
-				tokens = append(tokens, hlsVideoStream(width, height), xml.EndElement{Name: xml.Name{Local: "Stream"}}, hlsAudioStream(), xml.EndElement{Name: xml.Name{Local: "Stream"}})
+				tokens = append(tokens, proxyVideoStream(plan, width, height), xml.EndElement{Name: xml.Name{Local: "Stream"}}, proxyAudioStream(plan), xml.EndElement{Name: xml.Name{Local: "Stream"}})
 				changed = true
 			}
 		case xml.EndElement:
@@ -122,28 +135,53 @@ func removeXMLAttribute(start *xml.StartElement, name string) {
 }
 
 func hlsVideoStream(width, height int) xml.StartElement {
-	return xml.StartElement{Name: xml.Name{Local: "Stream"}, Attr: []xml.Attr{
+	return proxyVideoStream(defaultProxyStreamPlan(), width, height)
+}
+
+func proxyVideoStream(plan proxyStreamPlan, width, height int) xml.StartElement {
+	attributes := []xml.Attr{
 		{Name: xml.Name{Local: "streamType"}, Value: "1"},
-		{Name: xml.Name{Local: "codec"}, Value: "h264"},
 		{Name: xml.Name{Local: "width"}, Value: strconv.Itoa(width)},
 		{Name: xml.Name{Local: "height"}, Value: strconv.Itoa(height)},
-		{Name: xml.Name{Local: "decision"}, Value: "transcode"},
-		{Name: xml.Name{Local: "location"}, Value: "segments-av"},
+		{Name: xml.Name{Local: "decision"}, Value: plan.VideoDecision},
+		{Name: xml.Name{Local: "location"}, Value: plan.VideoLocation},
 		{Name: xml.Name{Local: "selected"}, Value: "1"},
-	}}
+	}
+	if plan.VideoCodec != "" {
+		attributes = append(attributes, xml.Attr{Name: xml.Name{Local: "codec"}, Value: plan.VideoCodec})
+	}
+	return xml.StartElement{Name: xml.Name{Local: "Stream"}, Attr: attributes}
 }
 
 func hlsAudioStream() xml.StartElement {
-	return xml.StartElement{Name: xml.Name{Local: "Stream"}, Attr: []xml.Attr{
+	return proxyAudioStream(defaultProxyStreamPlan())
+}
+
+func proxyAudioStream(plan proxyStreamPlan) xml.StartElement {
+	attributes := []xml.Attr{
 		{Name: xml.Name{Local: "streamType"}, Value: "2"},
-		{Name: xml.Name{Local: "codec"}, Value: "aac"},
 		{Name: xml.Name{Local: "channels"}, Value: "2"},
-		{Name: xml.Name{Local: "decision"}, Value: "transcode"},
-		{Name: xml.Name{Local: "location"}, Value: "segments-av"},
+		{Name: xml.Name{Local: "decision"}, Value: plan.AudioDecision},
+		{Name: xml.Name{Local: "location"}, Value: plan.AudioLocation},
 		{Name: xml.Name{Local: "selected"}, Value: "1"},
-	}}
+	}
+	if plan.AudioCodec != "" {
+		attributes = append(attributes, xml.Attr{Name: xml.Name{Local: "codec"}, Value: plan.AudioCodec})
+	}
+	return xml.StartElement{Name: xml.Name{Local: "Stream"}, Attr: attributes}
 }
 
 func hlsPartKey(sessionID string) string {
 	return hlsResourcePrefix + sessionID + "/base/index.m3u8"
+}
+
+func dashPartKey(sessionID string) string {
+	return hlsResourcePrefix + sessionID + "/base/index.mpd"
+}
+
+func proxyDecisionMediaAttributes(format proxyTranscodeFormat, sessionID string) (container, protocol, partKey string) {
+	if format == proxyTranscodeDASH {
+		return "mp4", "dash", dashPartKey(sessionID)
+	}
+	return "mpegts", "hls", hlsPartKey(sessionID)
 }

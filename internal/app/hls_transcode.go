@@ -51,6 +51,10 @@ type hlsSession struct {
 	processStopReason hlsProcessStopReason
 	copyAttempt       bool
 	audioTranscode    bool
+	audioStreamIndex  int
+	videoCodecString  string
+	forceTranscode    bool
+	format            proxyTranscodeFormat
 	sourceFile        string
 	sourceReady       chan struct{}
 	sourceErr         error
@@ -125,7 +129,14 @@ func (t *hlsTranscoder) cleanupLoop() {
 	}
 }
 
-func (t *hlsTranscoder) register(rawID, sourceURL, sourceProxyURL string, query url.Values, audioTranscode bool) (string, error) {
+// register creates (or refreshes) an HLS session. audioTranscode selects
+// audio-only conversion while copying the video stream; forceTranscode
+// disables the copy-first attempt entirely, for clients that already stated
+// they cannot decode the source streams.
+func (t *hlsTranscoder) register(rawID, sourceURL, sourceProxyURL string, query url.Values, audioTranscode, forceTranscode bool, format proxyTranscodeFormat, videoCodecString string, audioStreamIndex ...int) (string, error) {
+	if format != proxyTranscodeDASH {
+		format = proxyTranscodeHLS
+	}
 	id, err := normalizeHLSSessionID(rawID)
 	if err != nil {
 		return "", err
@@ -140,7 +151,7 @@ func (t *hlsTranscoder) register(rawID, sourceURL, sourceProxyURL string, query 
 	t.cleanupExpiredLocked(time.Now())
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
-		if existing.started && !existing.done && existing.sourceURL == sourceURL && existing.sourceProxyURL == sourceProxyURL {
+		if existing.started && !existing.done && existing.sourceURL == sourceURL && existing.sourceProxyURL == sourceProxyURL && existing.forceTranscode == forceTranscode && existing.videoCodecString == videoCodecString && sessionFormatLocked(existing) == format {
 			existing.lastAccess = time.Now()
 			existing.mu.Unlock()
 			t.mu.Unlock()
@@ -161,22 +172,58 @@ func (t *hlsTranscoder) register(rawID, sourceURL, sourceProxyURL string, query 
 		t.mu.Unlock()
 		return "", fmt.Errorf("create HLS transcode session: %w", err)
 	}
+	selectedAudioIndex := -1
+	if len(audioStreamIndex) > 0 {
+		selectedAudioIndex = audioStreamIndex[0]
+	}
 	t.sessions[id] = &hlsSession{
-		id:             id,
-		sourceURL:      sourceURL,
-		sourceProxyURL: sourceProxyURL,
-		directory:      directory,
-		width:          width,
-		height:         height,
-		bitrateKbps:    bitrate,
-		startOffset:    startOffset,
-		startSegment:   int(math.Floor(startOffset / hlsSegmentDurationSeconds)),
-		audioTranscode: audioTranscode,
-		lastAccess:     time.Now(),
-		seekSegments:   make(map[int]bool),
+		id:               id,
+		sourceURL:        sourceURL,
+		sourceProxyURL:   sourceProxyURL,
+		directory:        directory,
+		width:            width,
+		height:           height,
+		bitrateKbps:      bitrate,
+		startOffset:      startOffset,
+		startSegment:     int(math.Floor(startOffset / hlsSegmentDurationSeconds)),
+		audioTranscode:   audioTranscode,
+		audioStreamIndex: selectedAudioIndex,
+		videoCodecString: videoCodecString,
+		forceTranscode:   forceTranscode,
+		format:           format,
+		lastAccess:       time.Now(),
+		seekSegments:     make(map[int]bool),
 	}
 	t.mu.Unlock()
 	return id, nil
+}
+
+func sessionFormat(session *hlsSession) proxyTranscodeFormat {
+	if session == nil {
+		return proxyTranscodeHLS
+	}
+	session.mu.Lock()
+	format := sessionFormatLocked(session)
+	session.mu.Unlock()
+	return format
+}
+
+func sessionFormatLocked(session *hlsSession) proxyTranscodeFormat {
+	if session == nil || session.format == "" {
+		return proxyTranscodeHLS
+	}
+	return session.format
+}
+
+func (t *hlsTranscoder) sessionFormat(id string) (proxyTranscodeFormat, bool) {
+	session, ok := t.session(id)
+	if !ok {
+		return "", false
+	}
+	session.mu.Lock()
+	format := sessionFormatLocked(session)
+	session.mu.Unlock()
+	return format, true
 }
 
 func (t *hlsTranscoder) session(id string) (*hlsSession, bool) {
@@ -216,7 +263,7 @@ func (t *hlsTranscoder) start(ctx context.Context, id string) (string, error) {
 			processURL = validatedURL
 			session.sourceURL = validatedURL
 		}
-		if !internalProxy {
+		if !internalProxy && sessionFormatLocked(session) == proxyTranscodeHLS {
 			if duration, err := t.probeDuration(ctx, processURL, false); err == nil && duration > 0 {
 				session.duration = duration
 				if session.startOffset >= duration {
@@ -241,7 +288,11 @@ func (t *hlsTranscoder) start(ctx context.Context, id string) (string, error) {
 			// advertised until ffmpeg reports progress.
 			t.logger.Info("starting HLS without blocking duration probe", "session", id, "source", "protected-part")
 		}
-		session.copyAttempt = t.copyFirst
+		// A session registered for a client that already declared it cannot
+		// decode the source streams must transcode from the start; the
+		// copy-first attempt only helps when the client could have decoded
+		// the original codecs.
+		session.copyAttempt = t.copyFirst && !session.forceTranscode
 		args := buildFFmpegArgs(session)
 		session.cmd = exec.Command(t.ffmpegPath, args...)
 		session.cmd.Stdout = io.Discard
@@ -258,17 +309,25 @@ func (t *hlsTranscoder) start(ctx context.Context, id string) (string, error) {
 		processDone := session.processDone
 		go t.waitForProcess(session, cmd, processDone, &stderr)
 	}
-	playlist := filepath.Join(session.directory, "base", "index.m3u8")
+	manifest := transcodeManifestPathLocked(session)
 	vod := session.vod
+	format := sessionFormatLocked(session)
 	session.mu.Unlock()
 
 	if !vod {
-		if err := waitForHLSFile(ctx, playlist, session); err != nil {
+		if err := waitForHLSFile(ctx, manifest, session); err != nil {
 			return "", err
 		}
 	}
-	if _, err := os.Stat(playlist); err != nil {
+	if _, err := os.Stat(manifest); err != nil {
 		return "", err
+	}
+	if format == proxyTranscodeDASH {
+		body, err := os.ReadFile(manifest)
+		if err != nil {
+			return "", fmt.Errorf("read DASH manifest: %w", err)
+		}
+		return renderDASHManifest(session, body), nil
 	}
 	return renderHLSMasterPlaylist(session), nil
 }
@@ -669,10 +728,13 @@ func buildFFmpegArgsForRange(session *hlsSession, startOffset float64, startSegm
 	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
 	if startOffset > 0 && localSource {
 		args = append(args, "-ss", strconv.FormatFloat(startOffset, 'f', 3, 64))
-	} else if startOffset > 0 {
+	} else if startOffset > 0 || session.sourceProxyURL != "" {
 		// OpenList/115 sources may reject the byte range requested by ffmpeg's
-		// input seek. Mark the connection as forward-only and put -ss after -i
-		// so ffmpeg reads the response sequentially and seeks in decoded input.
+		// input seek. Protected Part URLs are also intentionally forward-only:
+		// the Part adapter follows the signed source redirect and must not be
+		// asked to reproduce arbitrary byte seeks against that remote host.
+		// Mark the connection as forward-only and put -ss after -i so ffmpeg
+		// reads the response sequentially and seeks in decoded input.
 		args = append(args, "-seekable", "0")
 	}
 	args = append(args, []string{
@@ -684,19 +746,39 @@ func buildFFmpegArgsForRange(session *hlsSession, startOffset float64, startSegm
 	if clipDuration > 0 {
 		args = append(args, "-t", strconv.FormatFloat(clipDuration, 'f', 3, 64))
 	}
-	hlsArgs := []string{
-		"-map", "0:v:0", "-map", "0:a:0?",
-		"-f", "hls", "-hls_time", "5", "-hls_list_size", "0",
+	audioMap := "0:a:0?"
+	if session.audioStreamIndex >= 0 {
+		audioMap = fmt.Sprintf("0:%d?", session.audioStreamIndex)
 	}
-	if !session.copyAttempt {
-		hlsArgs = append(hlsArgs, "-hls_flags", "independent_segments")
+	outputArgs := []string{"-map", "0:v:0", "-map", audioMap}
+	if sessionFormatLocked(session) == proxyTranscodeDASH {
+		outputArgs = append(outputArgs,
+			"-f", "dash",
+			"-seg_duration", "5",
+			"-use_timeline", "1",
+			"-use_template", "1",
+			"-window_size", "0",
+			"-extra_window_size", "0",
+			"-remove_at_exit", "0",
+			"-init_seg_name", "init-stream$RepresentationID$.m4s",
+			"-media_seg_name", "chunk-stream$RepresentationID$-$Number%05d$.m4s",
+			"-adaptation_sets", "id=0,streams=0 id=1,streams=1",
+			filepath.Join(session.directory, "base", "index.mpd"),
+		)
+	} else {
+		outputArgs = append(outputArgs,
+			"-f", "hls", "-hls_time", "5", "-hls_list_size", "0",
+		)
+		if !session.copyAttempt {
+			outputArgs = append(outputArgs, "-hls_flags", "independent_segments")
+		}
+		outputArgs = append(outputArgs,
+			"-start_number", strconv.Itoa(startSegment),
+			"-hls_segment_filename", filepath.Join(session.directory, "base", "%05d.ts"),
+			filepath.Join(session.directory, "base", playlistName),
+		)
 	}
-	hlsArgs = append(hlsArgs,
-		"-start_number", strconv.Itoa(startSegment),
-		"-hls_segment_filename", filepath.Join(session.directory, "base", "%05d.ts"),
-		filepath.Join(session.directory, "base", playlistName),
-	)
-	args = append(args, hlsArgs...)
+	args = append(args, outputArgs...)
 	codecArgs := []string{"-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main", "-pix_fmt", "yuv420p", "-b:v", strconv.Itoa(videoBitrate) + "k", "-maxrate", strconv.Itoa(session.bitrateKbps) + "k", "-bufsize", strconv.Itoa(session.bitrateKbps*2) + "k", "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000", "-g", "250", "-keyint_min", "1", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*5)"}
 	if session.copyAttempt {
 		codecArgs = []string{"-c:v", "copy"}
@@ -757,6 +839,16 @@ func hlsFFmpegPlaylistName(session *hlsSession) string {
 	return "index.m3u8"
 }
 
+func transcodeManifestPathLocked(session *hlsSession) string {
+	name := "index.m3u8"
+	if sessionFormatLocked(session) == proxyTranscodeDASH {
+		name = "index.mpd"
+	} else if session.vod {
+		name = "ffmpeg.m3u8"
+	}
+	return filepath.Join(session.directory, "base", name)
+}
+
 func writeHLSVODPlaylist(filename string, duration float64) error {
 	segmentCount := int(math.Ceil(duration / hlsSegmentDurationSeconds))
 	if segmentCount < 1 {
@@ -813,6 +905,91 @@ func renderHLSMasterPlaylist(session *hlsSession) string {
 		width, height = 1280, 720
 	}
 	return fmt.Sprintf("#EXTM3U\n#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=%d,RESOLUTION=%dx%d\n%s/base/index.m3u8\n", session.bitrateKbps*1000, width, height, hlsResourcePrefix+session.id)
+}
+
+func renderDASHManifest(session *hlsSession, body []byte) string {
+	text := string(body)
+	if !strings.Contains(text, "<BaseURL>") {
+		start := strings.Index(text, "<MPD")
+		if start >= 0 {
+			if end := strings.IndexByte(text[start:], '>'); end >= 0 {
+				end += start + 1
+				baseURL := fmt.Sprintf("<BaseURL>%s%s/base/</BaseURL>", hlsResourcePrefix, session.id)
+				text = text[:end] + baseURL + text[end:]
+			}
+		}
+	}
+	if session != nil && session.videoCodecString != "" {
+		text = rewriteDASHVideoCodec(text, session.videoCodecString)
+	}
+	return text
+}
+
+func rewriteDASHVideoCodec(text, codec string) string {
+	adaptationStart := 0
+	for {
+		relativeStart := strings.Index(text[adaptationStart:], "<AdaptationSet")
+		if relativeStart < 0 {
+			return text
+		}
+		start := adaptationStart + relativeStart
+		openEnd := strings.IndexByte(text[start:], '>')
+		if openEnd < 0 {
+			return text
+		}
+		openEnd += start + 1
+		openTag := text[start:openEnd]
+		closeRelative := strings.Index(text[openEnd:], "</AdaptationSet>")
+		if closeRelative < 0 {
+			return text
+		}
+		closeStart := openEnd + closeRelative
+		if strings.Contains(openTag, `contentType="video"`) || strings.Contains(openTag, `contentType='video'`) {
+			representationRelative := strings.Index(text[openEnd:closeStart], "<Representation")
+			if representationRelative >= 0 {
+				representationStart := openEnd + representationRelative
+				representationEnd := strings.IndexByte(text[representationStart:], '>')
+				if representationEnd >= 0 {
+					representationEnd += representationStart + 1
+					representation := text[representationStart:representationEnd]
+					if updated, ok := replaceDASHCodecsAttribute(representation, codec); ok {
+						return text[:representationStart] + updated + text[representationEnd:]
+					}
+				}
+			}
+		}
+		adaptationStart = closeStart + len("</AdaptationSet>")
+	}
+}
+
+func replaceDASHCodecsAttribute(tag, codec string) (string, bool) {
+	for _, quote := range []byte{'"', '\''} {
+		marker := "codecs=" + string(quote)
+		start := strings.Index(tag, marker)
+		if start < 0 {
+			continue
+		}
+		valueStart := start + len(marker)
+		valueEndRelative := strings.IndexByte(tag[valueStart:], quote)
+		if valueEndRelative < 0 {
+			return tag, false
+		}
+		valueEnd := valueStart + valueEndRelative
+		oldCodec := tag[valueStart:valueEnd]
+		if !strings.HasPrefix(oldCodec, "hev1") && !strings.HasPrefix(oldCodec, "hvc1") {
+			return tag, false
+		}
+		prefix := "hev1"
+		if strings.HasPrefix(oldCodec, "hvc1") {
+			prefix = "hvc1"
+		}
+		codecSuffix := strings.TrimPrefix(codec, "hev1")
+		if codecSuffix == "" {
+			return tag, false
+		}
+		return tag[:valueStart] + prefix + codecSuffix + tag[valueEnd:], true
+	}
+	return tag, false
 }
 
 func parseVideoResolution(value string) (int, int) {
@@ -878,14 +1055,18 @@ func parseHLSResourcePath(requestPath string) (string, string, bool) {
 	return parts[0], parts[1], true
 }
 
-// Plex Web can keep using the same session resource prefix for a DASH
-// fallback after the proxy has returned an HLS-shaped decision. In that case
-// resources such as 0/header and *.m4s belong to Plex's transcode session,
-// not to the proxy's filesystem-backed HLS session. Only claim resources that
-// this proxy actually produces.
-func isProxyOwnedHLSResource(relative string) bool {
+// Only claim resources that this proxy actually produces. Unknown resources
+// under Plex's session prefix remain eligible for transparent Plex handling.
+func isProxyOwnedTranscodeResource(session *hlsSession, relative string) bool {
 	lower := strings.ToLower(strings.TrimSpace(relative))
+	if sessionFormat(session) == proxyTranscodeDASH {
+		return strings.HasSuffix(lower, ".mpd") || strings.HasSuffix(lower, ".m4s") || strings.HasSuffix(lower, ".mp4")
+	}
 	return strings.HasSuffix(lower, ".m3u8") || strings.HasSuffix(lower, ".ts")
+}
+
+func isProxyOwnedHLSResource(relative string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(relative)), ".m3u8") || strings.HasSuffix(strings.ToLower(strings.TrimSpace(relative)), ".ts")
 }
 
 func isHLSResourceRequest(requestPath string) bool {

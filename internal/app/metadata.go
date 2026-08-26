@@ -338,6 +338,168 @@ func extractJSONMediaPartRecords(body []byte) [][]partRecord {
 	return result
 }
 
+// selectedPlayQueuePartIDs returns the Part IDs for the item Plex selected in
+// a play queue. Plex normally records this selection on the queue container
+// and the Video item, rather than on Part.selected. The latter is retained as
+// a fallback for older responses and synthetic test fixtures.
+func selectedPlayQueuePartIDs(contentType string, body []byte) map[string]bool {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	switch mediaType {
+	case "application/xml", "text/xml", "application/plex+xml":
+		return selectedXMLPlayQueuePartIDs(body)
+	case "application/json", "text/json":
+		return selectedJSONPlayQueuePartIDs(body)
+	default:
+		return make(map[string]bool)
+	}
+}
+
+func selectedXMLPlayQueuePartIDs(body []byte) map[string]bool {
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	selected := make(map[string]bool)
+	var selectedItemID, selectedMetadataID string
+	var allParts []partRecord
+
+	type queueVideo struct {
+		ratingKey       string
+		playQueueItemID string
+		parts           []partRecord
+	}
+	var current *queueVideo
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch typed := token.(type) {
+		case xml.StartElement:
+			switch typed.Name.Local {
+			case "MediaContainer":
+				selectedItemID = xmlAttributeValue(typed.Attr, "playQueueSelectedItemID")
+				selectedMetadataID = xmlAttributeValue(typed.Attr, "playQueueSelectedMetadataItemID")
+			case "Video":
+				current = &queueVideo{
+					ratingKey:       xmlAttributeValue(typed.Attr, "ratingKey"),
+					playQueueItemID: xmlAttributeValue(typed.Attr, "playQueueItemID"),
+				}
+			case "Part":
+				record := partRecordFromXMLAttrs(typed.Attr)
+				allParts = append(allParts, record)
+				if current != nil {
+					current.parts = append(current.parts, record)
+				}
+			}
+		case xml.EndElement:
+			if typed.Name.Local != "Video" || current == nil {
+				continue
+			}
+			matches := (selectedMetadataID != "" && current.ratingKey == selectedMetadataID) ||
+				(selectedItemID != "" && current.playQueueItemID == selectedItemID)
+			if matches {
+				for _, record := range current.parts {
+					addPartRecordIDs(selected, record)
+				}
+			}
+			current = nil
+		}
+	}
+	if len(selected) == 0 {
+		for _, record := range allParts {
+			if record.Selected {
+				addPartRecordIDs(selected, record)
+			}
+		}
+	}
+	return selected
+}
+
+func selectedJSONPlayQueuePartIDs(body []byte) map[string]bool {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil {
+		return make(map[string]bool)
+	}
+	root, ok := value.(map[string]any)
+	if !ok {
+		return make(map[string]bool)
+	}
+	if container, found := objectValue(root, "MediaContainer"); found {
+		if containerObject, isObject := container.(map[string]any); isObject {
+			root = containerObject
+		}
+	}
+	selectedItemID := jsonObjectString(root, "playQueueSelectedItemID")
+	selectedMetadataID := jsonObjectString(root, "playQueueSelectedMetadataItemID")
+	selected := make(map[string]bool)
+	var walk func(any)
+	walk = func(node any) {
+		switch typed := node.(type) {
+		case []any:
+			for _, child := range typed {
+				walk(child)
+			}
+		case map[string]any:
+			ratingKey := jsonObjectString(typed, "ratingKey")
+			playQueueItemID := jsonObjectString(typed, "playQueueItemID")
+			matches := (selectedMetadataID != "" && ratingKey == selectedMetadataID) ||
+				(selectedItemID != "" && playQueueItemID == selectedItemID)
+			if matches {
+				addJSONMediaPartIDs(typed, selected)
+			}
+			for _, child := range typed {
+				walk(child)
+			}
+		}
+	}
+	walk(root)
+	if len(selected) == 0 {
+		for _, record := range extractPartRecords("application/json", body) {
+			if record.Selected {
+				addPartRecordIDs(selected, record)
+			}
+		}
+	}
+	return selected
+}
+
+func addJSONMediaPartIDs(object map[string]any, selected map[string]bool) {
+	mediaValue, ok := objectValue(object, "Media")
+	if !ok {
+		return
+	}
+	mediaList, ok := mediaValue.([]any)
+	if !ok {
+		mediaList = []any{mediaValue}
+	}
+	for _, mediaNode := range mediaList {
+		mediaObject, ok := mediaNode.(map[string]any)
+		if !ok {
+			continue
+		}
+		partValue, ok := objectValue(mediaObject, "Part")
+		if !ok {
+			continue
+		}
+		partList, ok := partValue.([]any)
+		if !ok {
+			partList = []any{partValue}
+		}
+		for _, partNode := range partList {
+			partObject, ok := partNode.(map[string]any)
+			if ok {
+				addPartRecordIDs(selected, partRecordFromJSONObject(partObject))
+			}
+		}
+	}
+}
+
+func addPartRecordIDs(selected map[string]bool, record partRecord) {
+	for _, partID := range mappingPartIDs(record) {
+		selected[partID] = true
+	}
+}
+
 func objectValue(object map[string]any, name string) (any, bool) {
 	for key, value := range object {
 		if strings.EqualFold(key, name) {
@@ -359,6 +521,8 @@ func partRecordFromXMLAttrs(attributes []xml.Attr) partRecord {
 			record.Key = attribute.Value
 		case "path":
 			record.Path = attribute.Value
+		case "selected":
+			record.Selected = metadataBool(attribute.Value)
 		}
 	}
 	return record
@@ -366,10 +530,20 @@ func partRecordFromXMLAttrs(attributes []xml.Attr) partRecord {
 
 func partRecordFromJSONObject(object map[string]any) partRecord {
 	return partRecord{
-		ID:   jsonObjectString(object, "id"),
-		File: jsonObjectString(object, "file"),
-		Key:  jsonObjectString(object, "key"),
-		Path: jsonObjectString(object, "path"),
+		ID:       jsonObjectString(object, "id"),
+		File:     jsonObjectString(object, "file"),
+		Key:      jsonObjectString(object, "key"),
+		Path:     jsonObjectString(object, "path"),
+		Selected: jsonBool(jsonObjectValue(object, "selected")),
+	}
+}
+
+func metadataBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer directPlayDecisionCode="3000" generalDecisionCode="1001" transcodeDecisionCode="1001" x-fixture="strm-hevc-truehd-native-copy">
+  <Video ratingKey="strm-hevc-truehd-fixture">
+    <Media id="strm-hevc-truehd-media" protocol="dash" container="mkv" videoCodec="hevc" audioCodec="truehd" videoDecision="directplay" audioDecision="transcode" selected="1" x-unknown-media="preserve">
+      <Part id="strm-hevc-truehd-part" key="/library/parts/strm-hevc-truehd-part/file" file="http://127.0.0.1:3001/library/parts/strm-hevc-truehd-part/file" protocol="http" container="mkv" decision="directplay" selected="1" x-unknown-part="preserve">
+        <Stream id="strm-hevc-truehd-video" streamType="1" codec="hevc" decision="copy" selected="1" />
+        <Stream id="strm-hevc-truehd-audio" streamType="2" codec="aac" channels="2" decision="transcode" selected="1" />
+      </Part>
+    </Media>
+  </Video>
+</MediaContainer>

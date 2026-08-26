@@ -2,14 +2,82 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os/exec"
 	"path/filepath"
-	"time"
 	"testing"
+	"time"
 )
+
+func TestPlexDecisionFromBodyUsesExactPartDecision(t *testing.T) {
+	xmlBody := []byte(`<MediaContainer mdeDecisionCode="1000"><Video><Media videoDecision="directplay" audioDecision="directplay"><Part id="321" decision="transcode" /></Media></Video></MediaContainer>`)
+	if got := plexDecisionFromBody("application/xml", xmlBody); got != PlexDecisionTranscode {
+		t.Fatalf("Part decision must override Media summary: got=%v", got)
+	}
+
+	jsonBody := []byte(`{"MediaContainer":{"Metadata":[{"Media":[{"videoDecision":"directplay","audioDecision":"directplay","Part":[{"id":"321","decision":"transcode"}]}]}]}}`)
+	if got := plexDecisionFromBody("application/json", jsonBody); got != PlexDecisionTranscode {
+		t.Fatalf("JSON Part decision must override Media summary: got=%v", got)
+	}
+}
+
+func TestPlexDecisionFromBodyDoesNotMatchDecisionSubstrings(t *testing.T) {
+	xmlBody := []byte(`<MediaContainer><Video><Media videoDecision="directplay" audioDecision="directplay"><Part id="321" /></Media></Video></MediaContainer>`)
+	if got := plexDecisionFromBody("application/xml", xmlBody); got != PlexDecisionDirectPlay {
+		t.Fatalf("exact Media fallback should be direct play: got=%v", got)
+	}
+
+	streamOnly := []byte(`<MediaContainer><Video><Media><Part id="321" videoDecision="directplay" /></Media></Video></MediaContainer>`)
+	if got := plexDecisionFromBody("application/xml", streamOnly); got != PlexDecisionUnknown {
+		t.Fatalf("videoDecision on Part must not be treated as Part decision: got=%v", got)
+	}
+}
+
+func TestPlexDecisionFromBodyUsesSelectedStreamDecision(t *testing.T) {
+	xmlBody := []byte(`<MediaContainer directPlayDecisionCode="3000"><Video><Media><Part id="321" selected="1" decision="directplay"><Stream streamType="1" decision="transcode" /><Stream streamType="2" decision="transcode" /></Part></Media></Video></MediaContainer>`)
+	if got := plexDecisionFromBody("application/xml", xmlBody); got != PlexDecisionTranscode {
+		t.Fatalf("selected stream transcode must override Part directplay: got=%v", got)
+	}
+
+	jsonBody := []byte(`{"MediaContainer":{"Metadata":[{"Media":[{"Part":[{"id":"321","selected":true,"decision":"directplay","Stream":[{"streamType":1,"decision":"transcode"},{"streamType":2,"decision":"transcode"}]}]}]}]}}`)
+	if got := plexDecisionFromBody("application/json", jsonBody); got != PlexDecisionTranscode {
+		t.Fatalf("JSON selected stream transcode must override Part directplay: got=%v", got)
+	}
+}
+
+func TestPlexDecisionFromBodyIgnoresStreamsFromUnselectedPart(t *testing.T) {
+	xmlBody := []byte(`<MediaContainer><Video><Media><Part id="selected" selected="1" decision="directplay"><Stream streamType="1" decision="copy" /></Part><Part id="other" selected="0" decision="directplay"><Stream streamType="1" decision="transcode" /></Part></Media></Video></MediaContainer>`)
+	if got := plexDecisionFromBody("application/xml", xmlBody); got != PlexDecisionDirectPlay {
+		t.Fatalf("unselected Part stream transcode must be ignored: got=%v", got)
+	}
+
+	jsonBody := []byte(`{"MediaContainer":{"Metadata":[{"Media":[{"Part":[{"id":"selected","selected":true,"decision":"directplay","Stream":[{"streamType":1,"decision":"copy"}]},{"id":"other","selected":false,"decision":"directplay","Stream":[{"streamType":1,"decision":"transcode"}]}]}]}]}}`)
+	if got := plexDecisionFromBody("application/json", jsonBody); got != PlexDecisionDirectPlay {
+		t.Fatalf("JSON unselected Part stream transcode must be ignored: got=%v", got)
+	}
+}
+
+func TestPlexDecisionFromBodyIgnoresUnselectedStreamTranscode(t *testing.T) {
+	xmlBody := []byte(`<MediaContainer><Video><Media><Part id="321" selected="1" decision="directplay"><Stream streamType="1" selected="1" decision="directplay" /><Stream streamType="2" selected="0" decision="transcode" /></Part></Media></Video></MediaContainer>`)
+	if got := plexDecisionFromBody("application/xml", xmlBody); got != PlexDecisionDirectPlay {
+		t.Fatalf("unselected stream transcode must not override selected direct play: got=%v", got)
+	}
+}
+
+func TestSTRMProxyFallbackDoesNotTakeOverCanceledNativeRequest(t *testing.T) {
+	if shouldUseSTRMProxyFallback(http.StatusBadGateway, context.Canceled) {
+		t.Fatal("a canceled native request must not create a proxy fallback session")
+	}
+	if shouldUseSTRMProxyFallback(http.StatusBadGateway, context.DeadlineExceeded) {
+		t.Fatal("a timed-out native request must not create a proxy fallback session")
+	}
+	if !shouldUseSTRMProxyFallback(http.StatusBadGateway, nil) {
+		t.Fatal("an actual upstream rejection should remain eligible for fallback")
+	}
+}
 
 func TestSelectPlaybackPlanKeepsDirectFirstAndFallbacksExplicit(t *testing.T) {
 	tests := []struct {

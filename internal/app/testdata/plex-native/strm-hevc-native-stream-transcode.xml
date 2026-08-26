@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer directPlayDecisionCode="3000" generalDecisionCode="1001" transcodeDecisionCode="1001" x-fixture="strm-hevc-native-stream-transcode">
+  <Video ratingKey="strm-transcode-fixture">
+    <Media id="strm-transcode-media" protocol="dash" container="mp4" videoCodec="h264" audioCodec="aac" videoDecision="transcode" audioDecision="transcode" selected="1" x-unknown-media="preserve">
+      <Part id="strm-transcode-part" key="/library/parts/strm-transcode-part/file" file="http://127.0.0.1:3001/library/parts/strm-transcode-part/file" protocol="dash" container="mp4" decision="directplay" selected="1" x-unknown-part="preserve">
+        <Stream id="strm-transcode-video" streamType="1" codec="h264" decision="transcode" selected="1" />
+        <Stream id="strm-transcode-audio" streamType="2" codec="aac" channels="2" decision="transcode" selected="1" />
+      </Part>
+    </Media>
+  </Video>
+</MediaContainer>
